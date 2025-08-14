@@ -1,12 +1,12 @@
 # Constants - Testing Commands
 TEST_PYTEST = "pytest --no-header -rA --tb=no -p no:cacheprovider"
 TEST_PYTEST_VERBOSE = "pytest -rA --tb=long -p no:cacheprovider"
-TEST_ASTROPY_PYTEST = "pytest -rA -vv -o console_output_style=classic --tb=no"
+TEST_ASTROPY_PYTEST = "pytest --cov=astropy --cov-report json --cov-branch -rA -vv -o console_output_style=classic --tb=no"
 TEST_DJANGO = "./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1"
 TEST_DJANGO_NO_PARALLEL = "./tests/runtests.py --verbosity 2"
 TEST_SEABORN = "pytest --no-header -rA"
 TEST_SEABORN_VERBOSE = "pytest -rA --tb=long"
-TEST_PYTEST = "pytest -rA"
+TEST_PYTEST = "pytest -rA --cov=astropy --cov-report json --cov-branch"
 TEST_PYTEST_VERBOSE = "pytest -rA --tb=long"
 TEST_SPHINX = "tox --current-env -epy39 -v --"
 TEST_SYMPY = (

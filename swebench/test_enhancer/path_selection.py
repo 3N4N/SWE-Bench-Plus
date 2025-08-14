@@ -1,4 +1,5 @@
 import re
+import json
 import docker
 import platform
 import traceback
@@ -48,105 +49,78 @@ from swebench.harness.utils import (
     optional_str,
 )
 from swebench.harness.test_spec.test_spec import make_test_spec, TestSpec
+from swebench.test_enhancer.path_approx import get_mut_paths, pairwise
+
+MAX_SELECTED_CONST = 10
+
+def select_uncovered_paths(cov_report, src_file, src, path_history, logger):
+    # Get index of relevant file
+    cov_files = list(cov_report['files'].keys())
+    for file in cov_files:
+        if file == src_file:
+            key_file = file
+            break
+    missed_lines = cov_report['files'][key_file]['missing_lines']
+    missed_branches = cov_report['files'][key_file]['missing_branches']
+
+    print(missed_lines)
+    print(missed_branches)
+
+    logger.info(f"Approximating paths for src file: {src_file}")
+    methodDict = get_mut_paths(src, src_file, logger)
+
+    selected_paths = {}
+    for method, paths in methodDict.items():
+        # if method != 'is_fits': continue
+        # print(method)
+        # print(paths)
+        logger.info(f"Selecting paths for method: {method}")
+        candidate_paths = []
+        path_history.setdefault(method, {})
+        for path in paths:
+            cnt_missed_lines = 0
+            cnt_missed_branches = 0
+            for line in missed_lines:
+                for edge in path:
+                    if line >= edge[0] and line <= edge[1]:
+                        cnt_missed_lines+=1
+            for a,b in pairwise(path):
+                for branch in missed_branches:
+                    if a[0]<=branch[0] and a[1]>=branch[0] and b[0]<=branch[1] and b[1]>=branch[1]:
+                        cnt_missed_branches += 1
+            missed_score = cnt_missed_lines + cnt_missed_branches
+            if missed_score <= 0: continue
+            selected_count = path_history[method].get(tuple(path), 0)
+            if selected_count >= MAX_SELECTED_CONST: continue
+            candidate_paths.append((path,missed_score,selected_count))
+        # print(f"candidate_paths: {candidate_paths}")
+
+        if len(candidate_paths) == 0:
+            logger.info(f"Zero uncovered paths for method: {method} - skipping")
+            continue
+
+        ## Exploitation: Pick highest missed path
+        highest_path = max(candidate_paths, key=lambda o: o[1])[0]
+        highest_path = tuple(highest_path)
+        # print(f"highest_path: {highest_path}")
+        ## FIXME: path_history[method][highest_path] += 1
+        path_history[method][highest_path] = path_history[method].get(highest_path,0) + 1
+        selected_paths.setdefault(method, []).append(highest_path)
+
+        ## Exploration: Pick least selected path
+        least_path = min(candidate_paths, key=lambda o: o[2])[0]
+        least_path = tuple(least_path)
+        # print(f"least_path: {least_path}")
+        if least_path != highest_path:
+            ## FIXME: path_history[method][least_path] += 1
+            path_history[method][least_path] = path_history[method].get(least_path,0) + 1
+            selected_paths.setdefault(method, []).append(least_path)
+        logger.info(f"Selected paths for method: {method}\n{selected_paths}")
+
+    return selected_paths
 
 
-import copy
-from queue import Queue
-from py2cfg import CFGBuilder
-
-def pairwise(iterable):
-    import itertools
-    a,b = itertools.tee(iterable)
-    next(b, None)
-    return zip(a,b)
-
-def get_nedges(cfg):
-    start = cfg.entryblock
-    q = Queue()
-    n_edges = 0
-    res = []
-    v = list()
-    q.put(start)
-    while not q.empty():
-        curr = q.get()
-        n_edges += len(curr.exits)
-        res.append((curr.at(), curr.end()))
-        successors = [ block.target for block in curr.exits ]
-        for x in successors:
-            if x not in v:
-                v.append(x)
-                q.put(x)
-    return n_edges
-
-
-def _get_lineno_path(path):
-    line_path = []
-    for block in path:
-        start, end = block.at(), block.end()
-        line_path.append((start,end))
-    return line_path
-
-def _get_lineno_paths(paths):
-    line_paths = []
-    for path in paths:
-        line_path = _get_lineno_path(path)
-        line_paths.append(line_path)
-    return line_paths
-
-def explore_paths(cfg, flag=False):
-    start = cfg.entryblock
-    n_edges = get_nedges(cfg)
-    paths = []
-    visited = set()
-    q = Queue()
-    q.put([start])
-    while not q.empty():
-        # for i in range(q.qsize()):
-            current_path = q.get()
-            last_block = current_path[-1]
-            successors = [ block.target for block in last_block.exits ]
-            # successors = list({(item.at(),item.end()): item for item in successors}.values())
-            for successor in successors:
-                if successor in current_path: continue
-                next_path = copy.copy(current_path)
-                next_path.append(successor)
-                if len(successor.exits) > 0:    # if successor is NOT a terminal node
-                    line_path = _get_lineno_path(next_path)
-                    # print(line_path)
-                    q.put(next_path)
-                else:
-                    edges = [(x,y) for x,y in pairwise(next_path)]
-                    if len( [ edge for edge in edges if edge not in visited ] ) > 0:
-                        paths.append(next_path)
-                        visited.update(set(edges))
-                    if flag:
-                        if len(visited) >= n_edges - 1:
-                            line_paths = _get_lineno_paths(paths)
-                            print(f"Visted edges: {len(visited)}")
-                            return paths, line_paths
-                        else:
-                            v = [ (x.at(), y.at()) for x,y in visited ]
-                            print(v)
-                            print(f"Visted edges: {len(visited)} / {n_edges}")
-    print(f"Visted edges: {len(visited)}")
-    # v = [ (x.at(), y.at()) for x,y in visited ]
-    # print(v)
-    line_paths = _get_lineno_paths(paths)
-    return paths, line_paths
-
-def get_mut_paths(src, name='CFG_file'):
-    methodDict = {}
-    CFG_f = CFGBuilder(True).build_from_src(name, src)
-    for name, CFG_m in CFG_f.functioncfgs.items():
-        if name in [ '_decode_mixins', 'read_table_fits', '_encode_mixins']: continue
-        mut_start, mut_end = CFG_m.lineno, CFG_m.end_lineno
-        print(name, mut_start, mut_end, get_nedges(CFG_m))
-        paths, line_paths = explore_paths(CFG_m)
-        methodDict[name] = line_paths
-    return methodDict
-
-
-def select_method_paths(
+def main(
     instance_id,
     dataset_name,
     split,
@@ -224,6 +198,33 @@ def select_method_paths(
                     f"Cat coverage timed out after {timeout} seconds.",
                     logger,
                 )
+
+        # changes to dictionary in a function is changed in the main dict
+        # i.e., dicts are passed by ref
+        path_history = {}
+        selected_paths = {}
+        for src_file in src_files:
+            file_output, timed_out, total_runtime = exec_run_with_timeout(
+                container, f"cat {src_file}", timeout
+            )
+            file_output_path = log_dir / f"{src_file.replace('/','__')}"
+            with open(file_output_path, "w") as f:
+                f.write(file_output)
+                logger.info(f"File output for {instance_id} written to {file_output_path}")
+                if timed_out:
+                    f.write(f"\n\nTimeout error: {timeout} seconds exceeded.")
+                    raise EvaluationError(
+                        instance_id,
+                        f"Cat coverage timed out after {timeout} seconds.",
+                        logger,
+                    )
+            cov_report = json.loads(cov_output)
+            _selected_paths = select_uncovered_paths(cov_report, src_file, file_output,
+                                                     path_history.get(src_file,{}), logger)
+            selected_paths[src_file] = _selected_paths
+        print('-'*60)
+        print(selected_paths)
+        print('-'*60)
 
     except BuildImageError as e:
         error_msg = traceback.format_exc()
@@ -324,7 +325,7 @@ if __name__ == "__main__":
         resource.setrlimit(resource.RLIMIT_NOFILE, (args.open_file_limit, args.open_file_limit))
     client = docker.from_env()
 
-    select_method_paths(
+    main(
         args.instance_id,
         args.dataset_name,
         args.split,

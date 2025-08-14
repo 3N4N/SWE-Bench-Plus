@@ -93,7 +93,7 @@ def _get_lineno_paths(paths):
         line_paths.append(line_path)
     return line_paths
 
-def explore_paths(cfg, flag=False):
+def explore_paths(cfg, logger, flag=False):
     start = cfg.entryblock
     n_edges = get_nedges(cfg)
     paths = []
@@ -122,31 +122,29 @@ def explore_paths(cfg, flag=False):
                     if flag:
                         if len(visited) >= n_edges - 1:
                             line_paths = _get_lineno_paths(paths)
-                            print(f"Visted edges: {len(visited)}")
+                            logger.info(f"Visited edges: {len(visited)}")
                             return paths, line_paths
                         else:
                             v = [ (x.at(), y.at()) for x,y in visited ]
-                            print(v)
-                            print(f"Visted edges: {len(visited)} / {n_edges}")
-    print(f"Visted edges: {len(visited)}")
-    # v = [ (x.at(), y.at()) for x,y in visited ]
-    # print(v)
+                            logger.info(v)
+                            logger.info(f"Visited edges: {len(visited)} / {n_edges}")
+    logger.info(f"Visited edges: {len(visited)}")
     line_paths = _get_lineno_paths(paths)
     return paths, line_paths
 
-def get_mut_paths(src, name='CFG_file'):
+def get_mut_paths(src, name, logger):
     methodDict = {}
     CFG_f = CFGBuilder(True).build_from_src(name, src)
     for name, CFG_m in CFG_f.functioncfgs.items():
-        if name in [ '_decode_mixins', 'read_table_fits', '_encode_mixins']: continue
+        # if name in [ '_decode_mixins', 'read_table_fits', '_encode_mixins']: continue
         mut_start, mut_end = CFG_m.lineno, CFG_m.end_lineno
-        print(name, mut_start, mut_end, get_nedges(CFG_m))
-        paths, line_paths = explore_paths(CFG_m)
+        logger.info(f"{name}: {mut_start}, {mut_end}, {get_nedges(CFG_m)}")
+        paths, line_paths = explore_paths(CFG_m, logger)
         methodDict[name] = line_paths
     return methodDict
 
 
-def get_method_paths(
+def main(
     instance_id,
     dataset_name,
     split,
@@ -213,10 +211,10 @@ def get_method_paths(
                     )
 
         for src_file, src in srcs.items():
-            print(src_file)
-            methodDict = get_mut_paths(src, name=src_file)
+            logger.info(f"Path approximation for {src_file}")
+            methodDict = get_mut_paths(src, name=src_file, logger=logger)
             methodDicts[src_file] = methodDict
-            print(methodDict)
+            logger.info(f"Approximate paths: {methodDict}")
 
     except BuildImageError as e:
         error_msg = traceback.format_exc()
@@ -317,7 +315,7 @@ if __name__ == "__main__":
         resource.setrlimit(resource.RLIMIT_NOFILE, (args.open_file_limit, args.open_file_limit))
     client = docker.from_env()
 
-    get_method_paths(
+    main(
         args.instance_id,
         args.dataset_name,
         args.split,
