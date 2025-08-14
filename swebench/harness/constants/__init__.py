@@ -18,6 +18,7 @@ ENV_IMAGE_BUILD_DIR = Path("logs/build_images/env")
 INSTANCE_IMAGE_BUILD_DIR = Path("logs/build_images/instances")
 RUN_EVALUATION_LOG_DIR = Path("logs/run_evaluation")
 RUN_VALIDATION_LOG_DIR = Path("logs/run_validation")
+TESTENHANCER_LOG_DIR = Path("logs/test_enhancer")
 
 
 # Constants - Task Instance Class
