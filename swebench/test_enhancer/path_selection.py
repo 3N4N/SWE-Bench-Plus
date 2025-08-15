@@ -108,7 +108,7 @@ def select_uncovered_paths(cov_report, src_file, src, path_history, logger):
         selected_paths.setdefault(method, []).append(highest_path)
 
         ## Exploration: Pick least selected path
-        least_path = min(candidate_paths, key=lambda o: o[2])[0]
+        least_path = min(candidate_paths, key=lambda o: -o[2])[0]
         least_path = tuple(least_path)
         # print(f"least_path: {least_path}")
         if least_path != highest_path:
