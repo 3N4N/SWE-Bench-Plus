@@ -14,6 +14,10 @@ TEST_SYMPY = (
 )
 TEST_SYMPY_VERBOSE = "bin/test -C --verbose"
 
+TEST_FILE_PATTERN = {
+    'astropy/astropy': lambda src_file: "/".join(src_file.split('/')[:-1]) + '/tests/test_' + src_file.split('/')[-1]
+}
+
 
 # Constants - Installation Specifications
 SPECS_SKLEARN = {

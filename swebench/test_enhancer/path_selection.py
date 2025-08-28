@@ -201,9 +201,9 @@ def main(
 
         # changes to dictionary in a function is changed in the main dict
         # i.e., dicts are passed by ref
-        path_history = {}
-        selected_paths = {}
+        selected_paths = dict()
         for src_file in src_files:
+            path_history = dict()
             file_output, timed_out, total_runtime = exec_run_with_timeout(
                 container, f"cat {src_file}", timeout
             )
@@ -220,7 +220,7 @@ def main(
                     )
             cov_report = json.loads(cov_output)
             _selected_paths = select_uncovered_paths(cov_report, src_file, file_output,
-                                                     path_history.get(src_file,{}), logger)
+                                                     path_history, logger)
             selected_paths[src_file] = _selected_paths
         print('-'*60)
         print(selected_paths)
