@@ -60,8 +60,7 @@ from swebench.test_enhancer.llm_invocation import LLMInvocation
 maxCYC = 10
 maxNoIncreaseLimit = 3
 
-def run_tests_and_get_coverage(container, log_dir, instance_id, iter, timeout, logger):
-    log_dir = log_dir if iter is None else log_dir / str(iter)
+def run_tests_and_get_coverage(container, log_dir, instance_id, timeout, logger):
     log_dir.mkdir(parents=True, exist_ok=True)
     # Run eval script, write output to logs
     test_output, timed_out, total_runtime = exec_run_with_timeout(
@@ -174,8 +173,20 @@ def generate_test_by_prompt_llm(prompt):
                 started = False
                 break
             codeblock.append(line)
-    print(response)
-    return codeblock
+    codeblock = "\n".join(codeblock)
+    return response, codeblock
+
+def add_tests_to_test_file(container, log_dir, codeblock, src_file, test_file, tst, logger):
+    your_module = src_file.split('.py')[0].replace('/','.')
+    codeblock = codeblock.replace('your_module', your_module)
+    new_test_content = tst + '\n' + codeblock
+    new_test_file = Path(log_dir / f"{test_file.replace('/','__')}" )
+    new_test_file.write_text(new_test_content)
+    logger.info(
+        f"Generated tests written to {new_test_file}, now applying to container..."
+    )
+    copy_to_container(container, new_test_file, PurePosixPath(test_file))
+
 
 def generate_tests(container, log_dir, instance_id, src_file, src, test_file, tst, timeout, logger):
     ## TODO: testDeps = extractDependenciesForTestScope()
@@ -184,27 +195,28 @@ def generate_tests(container, log_dir, instance_id, src_file, src, test_file, ts
     # failedTestFeedback = []
     # methodDict = Algorithm 1 (srcFile)
     # TODO: maxCYC = getMaxComplexity(methodDict)
-    cur_cov_report = run_tests_and_get_coverage(container, log_dir, instance_id, None, timeout, logger)
+    cur_cov_report = run_tests_and_get_coverage(container, log_dir, instance_id, timeout, logger)
     cur_coverage = cur_cov_report['files'][src_file]['summary']['percent_covered']
     # TODO: add conditional: iter < maxCYC
     print(f"cur_coverage: {cur_coverage}")
-    while iter_no_increase < maxNoIncreaseLimit and math.ceil(cur_coverage) < 100:
+    while iter_no_increase < maxNoIncreaseLimit and iter < 2 and math.ceil(cur_coverage) < 100:
         selected_paths = select_uncovered_paths(cur_cov_report, src_file, src, path_history, logger)
         src_numbered = get_lined_source(src)
         prompt = build_prompt(src_numbered, tst, selected_paths)
-        codeblock = generate_test_by_prompt_llm(prompt)
-        file_output_path = log_dir / iter / f"new_{test_file.replace('/','__')}"
+        response, codeblock = generate_test_by_prompt_llm(prompt)
+        log_dir = log_dir / str(iter)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        file_output_path = log_dir / f"new_{test_file.replace('/','__')}"
         with open(file_output_path, "w") as f:
-            f.write("\n".join(codeblock))
+            f.write(codeblock)
             logger.info(f"Generated tests for {src_file} written to {file_output_path}")
-        # TODO: add_tests_to_test_file(generated_tests)
-        new_cov_report = run_tests_and_get_coverage(container, log_dir, instance_id, iter, timeout, logger)
+        add_tests_to_test_file(container, log_dir, codeblock, src_file, test_file, tst, logger )
+        new_cov_report = run_tests_and_get_coverage(container, log_dir, instance_id, timeout, logger)
         new_coverage = new_cov_report['files'][src_file]['summary']['percent_covered']
         print(f"{iter} new_coverage: {new_coverage}")
         iter_no_increase = 0 if new_coverage > cur_coverage else iter_no_increase + 1
         cur_coverage = new_coverage
         iter += 1
-        break
 
 def get_lined_source(src, range=None):
     src = src.split('\n')
