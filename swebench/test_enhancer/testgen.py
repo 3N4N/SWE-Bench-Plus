@@ -26,6 +26,9 @@ from swebench.harness.constants import (
     TESTENHANCER_LOG_DIR,
     TEST_FILE_PATTERN,
     UTF8,
+    MAP_REPO_VERSION_TO_SPECS,
+    START_TEST_OUTPUT,
+    END_TEST_OUTPUT,
 )
 from swebench.harness.docker_utils import (
     clean_images,
@@ -53,6 +56,8 @@ from swebench.harness.utils import (
 )
 from swebench.harness.run_evaluation import GIT_APPLY_CMDS
 from swebench.harness.test_spec.test_spec import make_test_spec, TestSpec
+from swebench.harness.test_spec.python import get_test_directives
+from swebench.harness.test_spec.create_scripts import make_eval_script_list
 from swebench.test_enhancer.path_approx import get_mut_paths, pairwise
 from swebench.test_enhancer.path_selection import select_uncovered_paths
 from swebench.test_enhancer.llm_invocation import LLMInvocation
@@ -63,9 +68,57 @@ maxNoIncreaseLimit = 3
 def run_tests_and_get_coverage(container, instance, log_dir, timeout, logger):
     instance_id = instance['instance_id']
     log_dir.mkdir(parents=True, exist_ok=True)
+    env_name = "testbed"
+    repo_directory = f"/{env_name}"
+    specs = MAP_REPO_VERSION_TO_SPECS[instance['repo']][instance['version']]
+
+    HEREDOC_DELIMITER = "EOF_114329324913"
+    # reset_tests_command = f"git checkout {base_commit} {' '.join(test_files)}"
+    test_command = " ".join(
+        [
+            MAP_REPO_VERSION_TO_SPECS[instance["repo"]][instance["version"]][
+                "test_cmd"
+            ],
+            *get_test_directives(instance),
+        ]
+    )
+    eval_commands = [
+        "source /opt/miniconda3/bin/activate",
+        f"conda activate {env_name}",
+        f"cd {repo_directory}",
+    ]
+    # eval_commands += [
+    #     f"git config --global --add safe.directory {repo_directory}",  # for nonroot user
+    #     f"cd {repo_directory}",
+    #     # This is just informational, so we have a record
+    #     "git status",
+    #     "git show",
+    #     # f"git -c core.fileMode=false diff {base_commit}",
+    #     "source /opt/miniconda3/bin/activate",
+    #     f"conda activate {env_name}",
+    # ]
+    # if "install" in specs:
+    #     eval_commands.append(specs["install"])
+    eval_commands += [
+        # reset_tests_command,  # Revert tests after done, leave the repo in the same state as before
+        f": '{START_TEST_OUTPUT}'",
+        test_command,
+        f": '{END_TEST_OUTPUT}'",
+        # reset_tests_command,  # Revert tests after done, leave the repo in the same state as before
+    ]
+
+    test_script = "\n".join(["#!/bin/bash", "set -uxo pipefail"] + eval_commands) + "\n"
+
+    eval_file = Path(log_dir / "run_tests.sh")
+    eval_file.write_text(test_script)
+    logger.info(
+        f"Testrun script for {instance_id} written to {eval_file}; copying to container..."
+    )
+    copy_to_container(container, eval_file, PurePosixPath("/run_tests.sh"))
+
     # Run eval script, write output to logs
     test_output, timed_out, total_runtime = exec_run_with_timeout(
-        container, "/bin/bash /eval.sh", timeout
+        container, "/bin/bash /run_tests.sh", timeout
     )
     test_output_path = log_dir / LOG_TEST_OUTPUT
     logger.info(f"Test runtime: {total_runtime:_.2f} seconds")
@@ -162,6 +215,15 @@ def generate_test_by_prompt_llm(prompt):
     llm_invoker =  LLMInvocation("gpt-4o-2024-08-06")
     response, prompt_token_count, response_token_count = llm_invoker.call_model(prompt)
     token_count = prompt_token_count + response_token_count
+
+    # response = """
+# This is the dummy response
+# ```python
+# def test_assert():
+    # assert 2 == 1+1
+# ```
+    # """
+
     response_list = response.split('\n')
     started = False
     codeblock = []
@@ -177,19 +239,25 @@ def generate_test_by_prompt_llm(prompt):
     codeblock = "\n".join(codeblock)
     return response, codeblock
 
-def add_tests_to_test_file(container, log_dir, codeblock, src_file, test_file, tst, logger):
-    your_module = src_file.split('.py')[0].replace('/','.')
-    codeblock = codeblock.replace('your_module', your_module)
-    new_test_content = tst + '\n' + codeblock
+def write_to_test_file(container, log_dir, test_file, test_content, logger):
     new_test_file = Path(log_dir / f"{test_file.replace('/','__')}" )
-    new_test_file.write_text(new_test_content)
+    new_test_file.write_text(test_content)
     logger.info(
-        f"Generated tests written to {new_test_file}, now applying to container..."
+        f"Writing to test file {new_test_file}, now applying to container..."
     )
     copy_to_container(container, new_test_file, PurePosixPath(test_file))
 
+def add_tests_to_test_file(container, log_dir, codeblock, src_file, test_file, test_content, logger):
+    your_module = src_file.split('.py')[0].replace('/','.')
+    codeblock = codeblock.replace('your_module', your_module)
+    new_test_content = test_content + '\n' + codeblock
+    # new_test_content = codeblock
+    write_to_test_file(container, log_dir, test_file, new_test_content, logger)
 
-def generate_tests(container, instance, log_dir, src_file, src, test_file, tst, timeout, logger):
+def reset_test_file(container, log_dir, test_file, test_content, logger):
+    write_to_test_file(container, log_dir, test_file, test_content, logger)
+
+def generate_tests(container, instance, log_dir, src_file, src, test_file, tests, timeout, logger):
     instance_id = instance['instance_id']
     ## TODO: testDeps = extractDependenciesForTestScope()
     iter, iter_no_increase = 0, 0
@@ -204,7 +272,7 @@ def generate_tests(container, instance, log_dir, src_file, src, test_file, tst, 
     while iter_no_increase < maxNoIncreaseLimit and iter < 2 and math.ceil(cur_coverage) < 100:
         selected_paths = select_uncovered_paths(cur_cov_report, src_file, src, path_history, logger)
         src_numbered = get_lined_source(src)
-        prompt = build_prompt(src_numbered, tst, selected_paths)
+        prompt = build_prompt(src_numbered, tests, selected_paths)
         response, codeblock = generate_test_by_prompt_llm(prompt)
         _log_dir = log_dir / str(iter)
         _log_dir.mkdir(parents=True, exist_ok=True)
@@ -212,10 +280,12 @@ def generate_tests(container, instance, log_dir, src_file, src, test_file, tst, 
         with open(file_output_path, "w") as f:
             f.write(codeblock)
             logger.info(f"Generated tests for {src_file} written to {file_output_path}")
-        add_tests_to_test_file(container, _log_dir, codeblock, src_file, test_file, tst, logger )
+        add_tests_to_test_file(container, _log_dir, codeblock, src_file, test_file, tests, logger )
         new_cov_report = run_tests_and_get_coverage(container, instance, _log_dir, timeout, logger)
         new_coverage = new_cov_report['files'][src_file]['summary']['percent_covered']
         print(f"{iter} new_coverage: {new_coverage}")
+        if new_coverage <= cur_coverage:
+            reset_test_file(container, _log_dir, test_file, tests, logger)
         iter_no_increase = 0 if new_coverage > cur_coverage else iter_no_increase + 1
         cur_coverage = new_coverage
         iter += 1
@@ -337,8 +407,8 @@ def main(
             file_output_path = log_dir / f"{src_file.replace('/','__')}"
             src = get_file_output(src_file, file_output_path)
             file_output_path = log_dir / f"{test_file.replace('/','__')}"
-            tst = get_file_output(test_file, file_output_path)
-            generate_tests(container, instance, log_dir, src_file, src, test_file, tst, timeout, logger)
+            tests = get_file_output(test_file, file_output_path)
+            generate_tests(container, instance, log_dir, src_file, src, test_file, tests, timeout, logger)
 
     except BuildImageError as e:
         error_msg = traceback.format_exc()
