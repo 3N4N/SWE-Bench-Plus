@@ -253,6 +253,7 @@ def add_tests_to_test_file(container, log_dir, codeblock, src_file, test_file, t
     new_test_content = test_content + '\n' + codeblock
     # new_test_content = codeblock
     write_to_test_file(container, log_dir, test_file, new_test_content, logger)
+    return new_test_content
 
 def reset_test_file(container, log_dir, test_file, test_content, logger):
     write_to_test_file(container, log_dir, test_file, test_content, logger)
@@ -280,12 +281,14 @@ def generate_tests(container, instance, log_dir, src_file, src, test_file, tests
         with open(file_output_path, "w") as f:
             f.write(codeblock)
             logger.info(f"Generated tests for {src_file} written to {file_output_path}")
-        add_tests_to_test_file(container, _log_dir, codeblock, src_file, test_file, tests, logger )
+        new_tests = add_tests_to_test_file(container, _log_dir, codeblock, src_file, test_file, tests, logger )
         new_cov_report = run_tests_and_get_coverage(container, instance, _log_dir, timeout, logger)
         new_coverage = new_cov_report['files'][src_file]['summary']['percent_covered']
         print(f"{iter} new_coverage: {new_coverage}")
         if new_coverage <= cur_coverage:
             reset_test_file(container, _log_dir, test_file, tests, logger)
+        else:
+            tests = new_tests
         iter_no_increase = 0 if new_coverage > cur_coverage else iter_no_increase + 1
         cur_coverage = new_coverage
         iter += 1
@@ -344,9 +347,10 @@ def main(
         container.start()
         logger.info(f"Container for {instance_id} started: {container.id}")
 
-        # Copy model prediction as patch file to container
+        # Copy golden patch and test patch as patch file to container
+        patch_content = instance['patch'] + '\n' + instance['test_patch']
         patch_file = Path(log_dir / "patch.diff")
-        patch_file.write_text(instance['patch'] or "")
+        patch_file.write_text(patch_content)
         logger.info(
             f"Intermediate patch for {instance_id} written to {patch_file}, now applying to container..."
         )
