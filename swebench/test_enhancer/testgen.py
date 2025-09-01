@@ -24,7 +24,6 @@ from swebench.harness.constants import (
     LOG_TEST_OUTPUT,
     RUN_EVALUATION_LOG_DIR,
     TESTENHANCER_LOG_DIR,
-    TEST_FILE_PATTERN,
     UTF8,
     MAP_REPO_VERSION_TO_SPECS,
     START_TEST_OUTPUT,
@@ -87,22 +86,52 @@ def run_tests_and_get_coverage(container, instance, log_dir, timeout, logger):
         f"conda activate {env_name}",
         f"cd {repo_directory}",
     ]
-    # eval_commands += [
-    #     f"git config --global --add safe.directory {repo_directory}",  # for nonroot user
-    #     f"cd {repo_directory}",
-    #     # This is just informational, so we have a record
-    #     "git status",
-    #     "git show",
-    #     # f"git -c core.fileMode=false diff {base_commit}",
-    #     "source /opt/miniconda3/bin/activate",
-    #     f"conda activate {env_name}",
-    # ]
-    # if "install" in specs:
-    #     eval_commands.append(specs["install"])
+    if instance['repo'] == "django/django":
+        coverage_command = "coverage json -o coverage.json"
+        coverage_install = "python --version && python -m pip install -U pip\npip install -U 'coverage==6.2'"
+        coverage_patch = '''
+diff --git a/coverage/jsonreport.py b/coverage/jsonreport.py
+index 43edc4520..7ca468e32 100644
+--- a/coverage/jsonreport.py
++++ b/coverage/jsonreport.py
+@@ -102,4 +102,17 @@ def report_one_file(self, coverage_data, analysis):
+                 'covered_branches': nums.n_executed_branches,
+                 'missing_branches': nums.n_missing_branches,
+             })
++            reported_file['executed_branches'] = list(
++                [-1, -2] # _convert_branch_arcs(analysis.executed_branch_arcs())
++            )
++            reported_file['missing_branches'] = list(
++                _convert_branch_arcs(analysis.missing_branch_arcs())
++            )
+         return reported_file
++
++
++def _convert_branch_arcs(branch_arcs):
++    """Convert branch arcs to a list of two-element tuples."""
++    for source, targets in branch_arcs.items():
++        for target in targets:
++            yield source, target if target != -1 else 0
+        '''
+        coverage_apply_patch_command = (
+            f"git apply -v - <<'{HEREDOC_DELIMITER}'\n{coverage_patch}\n{HEREDOC_DELIMITER}"
+        )
+    else:
+        coverage_command = ""
+        coverage_install = ""
     eval_commands += [
         # reset_tests_command,  # Revert tests after done, leave the repo in the same state as before
+        coverage_install,
+        "pushd /opt/miniconda3/envs/testbed/lib/python3.6/site-packages/",
+        coverage_apply_patch_command,
+        "popd",
         f": '{START_TEST_OUTPUT}'",
         test_command,
+        coverage_command,
+        # "ls -R /opt/miniconda3/",
+        # "cat -n /opt/miniconda3/envs/testbed/lib/python3.6/site-packages/coverage/jsonreport.py",
+        # "ls -R",
+        # "pip list",
         f": '{END_TEST_OUTPUT}'",
         # reset_tests_command,  # Revert tests after done, leave the repo in the same state as before
     ]
@@ -203,15 +232,15 @@ Please generate test for `{{method_name}} to cover the path
 """ + "\n".join(test_prompt)
     user_prompt = jenv.from_string(prompt_template).render(source_file_numbered=src_numbered, test_file=test_file)
     user_prompt = user_prompt + test_prompt
-    print("="*60)
-    print(test_prompt)
-    print("="*60)
-    print(selected_paths)
+    # print("="*60)
+    # print(test_prompt)
+    # print("="*60)
+    # print(selected_paths)
     system_prompt = "You are an expert Python test-driven developer"
     return {"system": system_prompt, "user": user_prompt}
 
 
-def generate_test_by_prompt_llm(prompt):
+def generate_test_by_prompt_llm(prompt, iter):
     llm_invoker =  LLMInvocation("gpt-4o-2024-08-06")
     response, prompt_token_count, response_token_count = llm_invoker.call_model(prompt)
     token_count = prompt_token_count + response_token_count
@@ -269,12 +298,12 @@ def generate_tests(container, instance, log_dir, src_file, src, test_file, tests
     cur_cov_report = run_tests_and_get_coverage(container, instance, log_dir, timeout, logger)
     cur_coverage = cur_cov_report['files'][src_file]['summary']['percent_covered']
     # TODO: add conditional: iter < maxCYC
-    print(f"cur_coverage: {cur_coverage}")
-    while iter_no_increase < maxNoIncreaseLimit and iter < 2 and math.ceil(cur_coverage) < 100:
+    logger.info(f"cur_coverage: {cur_coverage}")
+    while iter_no_increase < maxNoIncreaseLimit and iter < 10 and math.ceil(cur_coverage) < 100:
         selected_paths = select_uncovered_paths(cur_cov_report, src_file, src, path_history, logger)
         src_numbered = get_lined_source(src)
         prompt = build_prompt(src_numbered, tests, selected_paths)
-        response, codeblock = generate_test_by_prompt_llm(prompt)
+        response, codeblock = generate_test_by_prompt_llm(prompt, iter)
         _log_dir = log_dir / str(iter)
         _log_dir.mkdir(parents=True, exist_ok=True)
         file_output_path = _log_dir / f"new_{test_file.replace('/','__')}"
@@ -284,7 +313,7 @@ def generate_tests(container, instance, log_dir, src_file, src, test_file, tests
         new_tests = add_tests_to_test_file(container, _log_dir, codeblock, src_file, test_file, tests, logger )
         new_cov_report = run_tests_and_get_coverage(container, instance, _log_dir, timeout, logger)
         new_coverage = new_cov_report['files'][src_file]['summary']['percent_covered']
-        print(f"{iter} new_coverage: {new_coverage}")
+        logger.info(f"{iter} new_coverage: {new_coverage}")
         if new_coverage <= cur_coverage:
             reset_test_file(container, _log_dir, test_file, tests, logger)
         else:
@@ -333,7 +362,19 @@ def main(
     assert len(dataset) == 1
     instance = dataset[0]
     src_files = re.findall(r'^diff --git a/(.*?) b/', instance['patch'], flags=re.MULTILINE)
-    # test_files = re.findall(r'^diff --git a/(.*?) b/', instance['test_patch'], flags=re.MULTILINE)
+    test_files = re.findall(r'^diff --git a/(.*?) b/', instance['test_patch'], flags=re.MULTILINE)
+
+    def get_modified_files(diff_text: str):
+        modified_files = []
+        for header in re.finditer(r"^diff --git a/(.+?) b/\1", diff_text, re.MULTILINE):
+            file_path = header.group(1)
+            # Ensure file is not marked as new or deleted
+            context_start = diff_text.find(header.group(0))
+            context = diff_text[context_start: context_start + 200]  # look ahead
+            if "new file mode" not in context and "deleted file mode" not in context:
+                modified_files.append(file_path)
+        return modified_files
+    test_files = get_modified_files(instance['test_patch'])
 
     test_spec = make_test_spec(
         instance, namespace=namespace, instance_image_tag=instance_image_tag
@@ -401,13 +442,18 @@ def main(
                     )
             return file_output
 
+        def match_test_file(src_file, test_files):
+            src_tail = src_file.split('/')[-1].split('.py')[0]
+            if len(test_files) == 1: return test_files[0]
+            for test_file in test_files:
+                test_tail = test_file.split('/')[-1].split('.py')[0]
+                if test_tail == f'test_{src_tail}':
+                    return test_file
         for src_file in src_files:
-            test_file = TEST_FILE_PATTERN[instance['repo']](src_file)
-            logger.info(f"Generating tests for {src_file} -> {test_file}")
+            test_file = match_test_file(src_file, test_files)
+            if test_file is None: continue
+            print(f"Generating tests for {src_file} -> {test_file}")
             path_history = dict()
-            # src = get_lined_source(file_output, (400,410))
-            # import IPython; IPython.embed()
-            # print(src)
             file_output_path = log_dir / f"{src_file.replace('/','__')}"
             src = get_file_output(src_file, file_output_path)
             file_output_path = log_dir / f"{test_file.replace('/','__')}"
