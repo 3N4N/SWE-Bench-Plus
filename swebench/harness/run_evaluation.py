@@ -298,6 +298,7 @@ def run_instances(
             instances,
         )
     )
+    # exit()
 
     # print number of existing instance images
     instance_image_ids = {x.instance_image_key for x in test_specs}

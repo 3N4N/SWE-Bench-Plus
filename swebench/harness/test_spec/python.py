@@ -385,6 +385,12 @@ def make_eval_script_list_py(
     apply_test_patch_command = (
         f"git apply -v - <<'{HEREDOC_DELIMITER}'\n{test_patch}\n{HEREDOC_DELIMITER}"
     )
+    enan_apply_new_tests_command = "\n".join([
+        "{",
+          "echo 'def test_testenhancer_failing():'",
+          "echo '    assert 2 == 3'",
+          f"}} >> astropy/io/fits/tests/test_connect.py",
+    ])
     test_command = " ".join(
         [
             MAP_REPO_VERSION_TO_SPECS[instance["repo"]][instance["version"]][
@@ -415,6 +421,7 @@ def make_eval_script_list_py(
     eval_commands += [
         reset_tests_command,
         apply_test_patch_command,
+        # enan_apply_new_tests_command,
         f": '{START_TEST_OUTPUT}'",
         test_command,
         f": '{END_TEST_OUTPUT}'",

@@ -1,18 +1,31 @@
 # Constants - Testing Commands
 TEST_PYTEST = "pytest --no-header -rA --tb=no -p no:cacheprovider"
 TEST_PYTEST_VERBOSE = "pytest -rA --tb=long -p no:cacheprovider"
-TEST_ASTROPY_PYTEST = "pytest --cov=astropy --cov-report json --cov-branch -rA -vv -o console_output_style=classic --tb=no"
-TEST_DJANGO = "coverage run --branch ./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1"
+TEST_ASTROPY_PYTEST = "pytest -rA -vv -o console_output_style=classic --tb=no"
+TEST_DJANGO = "./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1"
 TEST_DJANGO_NO_PARALLEL = "./tests/runtests.py --verbosity 2"
 TEST_SEABORN = "pytest --no-header -rA"
 TEST_SEABORN_VERBOSE = "pytest -rA --tb=long"
-TEST_PYTEST = "pytest -rA --cov --cov-report json --cov-branch"
+TEST_PYTEST = "pytest -rA"
 TEST_PYTEST_VERBOSE = "pytest -rA --tb=long"
 TEST_SPHINX = "tox --current-env -epy39 -v --"
 TEST_SYMPY = (
     "PYTHONWARNINGS='ignore::UserWarning,ignore::SyntaxWarning' bin/test -C --verbose"
 )
 TEST_SYMPY_VERBOSE = "bin/test -C --verbose"
+
+TEST_ASTROPY_PYTEST = "pytest --cov=astropy --cov-branch --cov-report json -rA -vv -o console_output_style=classic --tb=no"
+TEST_DJANGO = "coverage run --branch ./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1"
+TEST_DJANGO_NO_PARALLEL = "coverage run --branch ./tests/runtests.py --verbosity 2"
+TEST_SEABORN = "pytest --cov --cov-branch --cov-report json --no-header -rA"
+TEST_SEABORN_VERBOSE = "pytest -rA --cov --cov-branch --cov-report json --tb=long"
+TEST_PYTEST = "pytest -rA --cov --cov-branch --cov-report json"
+TEST_PYTEST_VERBOSE = "pytest -rA --cov --cov-branch --cov-report json --tb=long"
+TEST_SPHINX = "tox --current-env -epy39 -v --"
+TEST_SYMPY = (
+    "PYTHONWARNINGS='ignore::UserWarning,ignore::SyntaxWarning' coverage run --branch bin/test -C --verbose"
+)
+TEST_SYMPY_VERBOSE = "coverage run --branch bin/test -C --verbose"
 
 # Constants - Installation Specifications
 SPECS_SKLEARN = {

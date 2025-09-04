@@ -53,7 +53,9 @@ from swebench.harness.utils import (
     str2bool,
     optional_str,
 )
+from swebench.harness.grading import get_eval_report
 from swebench.harness.run_evaluation import GIT_APPLY_CMDS
+from swebench.harness.test_spec.test_spec import extract_test_headers, get_node
 from swebench.harness.test_spec.test_spec import make_test_spec, TestSpec
 from swebench.harness.test_spec.python import get_test_directives
 from swebench.harness.test_spec.create_scripts import make_eval_script_list
@@ -61,10 +63,7 @@ from swebench.test_enhancer.path_approx import get_mut_paths, pairwise
 from swebench.test_enhancer.path_selection import select_uncovered_paths
 from swebench.test_enhancer.llm_invocation import LLMInvocation
 
-maxCYC = 10
-maxNoIncreaseLimit = 3
-
-def run_tests_and_get_coverage(container, instance, log_dir, timeout, logger):
+def run_tests(container, instance, log_dir, timeout, logger, patch_coverage=False):
     instance_id = instance['instance_id']
     log_dir.mkdir(parents=True, exist_ok=True)
     env_name = "testbed"
@@ -86,7 +85,7 @@ def run_tests_and_get_coverage(container, instance, log_dir, timeout, logger):
         f"conda activate {env_name}",
         f"cd {repo_directory}",
     ]
-    if instance['repo'] == "django/django":
+    if patch_coverage and instance['repo'] == "django/django" and float(instance['version']) < 4.0 :
         coverage_command = "coverage json -o coverage.json"
         coverage_install = "python --version && python -m pip install -U pip\npip install -U 'coverage==6.2'"
         coverage_patch = '''
@@ -113,25 +112,34 @@ index 43edc4520..7ca468e32 100644
 +        for target in targets:
 +            yield source, target if target != -1 else 0
         '''
-        coverage_apply_patch_command = (
+        coverage_apply_patch_command = "\n".join(
+            "pushd $(python -c 'from distutils.sysconfig import get_python_lib; print(get_python_lib())')",
             f"git apply -v - <<'{HEREDOC_DELIMITER}'\n{coverage_patch}\n{HEREDOC_DELIMITER}"
+            "popd",
         )
+    elif patch_coverage and instance['repo'] == "django/django":
+        coverage_command = "coverage json -o coverage.json"
+        coverage_install = "python --version\npip install -U coverage"
+        coverage_apply_patch_command = ""
+    elif instance['repo'] == 'sympy/sympy':
+        coverage_command = "coverage json -o coverage.json"
+        coverage_install = "python --version\npip install -U coverage\ncoverage --version"
+        coverage_apply_patch_command = ""
+    elif instance['repo'] == 'sphinx-doc/sphinx':
+        coverage_command = ""
+        coverage_install = ""
+        coverage_apply_patch_command = "sed -i -e 's/ pytest / pytest --cov --cov-branch --cov-report json /g' tox.ini"
     else:
         coverage_command = ""
         coverage_install = ""
+        coverage_apply_patch_command = ""
     eval_commands += [
         # reset_tests_command,  # Revert tests after done, leave the repo in the same state as before
         coverage_install,
-        "pushd /opt/miniconda3/envs/testbed/lib/python3.6/site-packages/",
         coverage_apply_patch_command,
-        "popd",
         f": '{START_TEST_OUTPUT}'",
         test_command,
         coverage_command,
-        # "ls -R /opt/miniconda3/",
-        # "cat -n /opt/miniconda3/envs/testbed/lib/python3.6/site-packages/coverage/jsonreport.py",
-        # "ls -R",
-        # "pip list",
         f": '{END_TEST_OUTPUT}'",
         # reset_tests_command,  # Revert tests after done, leave the repo in the same state as before
     ]
@@ -161,6 +169,10 @@ index 43edc4520..7ca468e32 100644
                 f"Test timed out after {timeout} seconds.",
                 logger,
             )
+    return test_output_path
+
+def get_coverage(container, instance, log_dir, timeout, logger):
+    instance_id = instance['instance_id']
     cov_output, timed_out, total_runtime = exec_run_with_timeout(
         container, "cat coverage.json", timeout
     )
@@ -178,8 +190,107 @@ index 43edc4520..7ca468e32 100644
     cov_report = json.loads(cov_output)
     return cov_report
 
+import ast
+from pathlib import Path
+from typing import Dict, Set, Tuple, Union, Iterable
 
-def build_prompt(src_numbered, test_file, selected_paths):
+def parse_targets(targets: Iterable[str]) -> Tuple[Set[str], Dict[str, Set[str]]]:
+    funcs: Set[str] = set()
+    methods: Dict[str, Set[str]] = {}
+    for t in targets:
+        if "." in t:
+            cls, meth = t.split(".", 1)
+            methods.setdefault(cls, set()).add(meth)
+        else:
+            funcs.add(t)
+    return funcs, methods
+
+def remove_functions_from_ast(tree: ast.Module,
+                              top_funcs: Set[str],
+                              class_methods: Dict[str, Set[str]]) -> ast.Module:
+    def is_func(node): return isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+
+    def prune_class(cnode: ast.ClassDef) -> ast.ClassDef:
+        new_body = []
+        for n in cnode.body:
+            # remove direct methods whose names match
+            if is_func(n) and n.name in class_methods.get(cnode.name, set()):
+                continue
+            # recurse into nested classes
+            if isinstance(n, ast.ClassDef):
+                new_body.append(prune_class(n))
+            else:
+                new_body.append(n)
+        cnode.body = new_body
+        return cnode
+
+    new_body = []
+    for node in tree.body:
+        # remove top-level functions
+        if is_func(node) and node.name in top_funcs:
+            continue
+        # prune class methods
+        if isinstance(node, ast.ClassDef):
+            new_body.append(prune_class(node))
+        else:
+            new_body.append(node)
+    tree.body = new_body
+    return tree
+
+def remove_functions_from_file(src, targets):
+    tree = ast.parse(src)
+    top_funcs, class_methods = parse_targets(targets)
+    tree = remove_functions_from_ast(tree, top_funcs, class_methods)
+
+    try:
+        new_src = ast.unparse(tree)  # Python 3.9+
+    except AttributeError:
+        import astor  # pip install astor
+        new_src = astor.to_source(tree)
+    new_src_split = new_src.split('\n')
+
+    new_src = []
+    for i in range(len(new_src_split)):
+        if new_src_split[i].startswith('class'):
+            if (i != len(new_src_split) - 1) and (len(new_src_split[i+1])>0) and (new_src_split[i+1][0]==' '):
+                new_src.append(new_src_split[i])
+        else:
+            new_src.append(new_src_split[i])
+
+    new_src = "\n".join(new_src)
+    return new_src
+
+def get_successful_tests(container, dataset_name, split, instance,
+               test_spec, test_file, test_content, test_output_path,
+               log_dir, timeout, logger):
+    instance_id = instance['instance_id']
+    repo = instance['repo']
+    test_headers = extract_test_headers(repo, test_file, test_content)
+    test_spec.FAIL_TO_PASS.extend(test_headers)
+    # print(f"fail -> pass: {test_spec.FAIL_TO_PASS}")
+    predictions = get_predictions_from_file('gold', dataset_name, split)
+    predictions = {pred[KEY_INSTANCE_ID]: pred for pred in predictions}
+    pred = predictions[instance_id]
+    report = get_eval_report(
+        test_spec=test_spec,
+        prediction=pred,
+        test_log_path=test_output_path,
+        include_tests_status=True,
+    )
+    tests_success = report[instance_id]['tests_status']['FAIL_TO_PASS']['success']
+    tests_failure = report[instance_id]['tests_status']['FAIL_TO_PASS']['failure']
+    new_tests_success = [ test for test in test_headers if test in tests_success ]
+    new_tests_failure = [ test for test in test_headers if test in tests_failure ]
+    to_remove = [ get_node(repo, test_file, test) for test in new_tests_failure ]
+    to_remove = [ entry for entry in to_remove if entry is not None ]
+    logger.info(f"Remove targets: {to_remove}")
+    if to_remove is not None and len(to_remove) > 0:
+        correct_test_content = remove_functions_from_file(test_content, to_remove)
+    else:
+        correct_test_content = test_content
+    return correct_test_content
+
+def build_prompt(src_numbered, test_file, selected_paths, log_dir):
     prompt_template = """
 ## Overview
 You are an expert software engineer code assistant tasked with generating additional unit tests for a Java source file and its corresponding test file.
@@ -192,21 +303,24 @@ Your objective is to enhance both line coverage and branch coverage by adding ne
 4. Maintain Consistency: Ensure new tests are consistent with the existing test suite in terms of style, naming conventions, and structure. Assume new tests are part of the same suite if a test suite exists.
 
 ## Source File
-Here is the source file that you will be writing tests against, called `CSVParser.java`.
+Here is the source file that you will be writing tests against.
 We have manually added line numbers to assist in understanding the code coverage.
 These line numbers are not part of the original code.
 
-## Source File
-Here is the source file that you will be writing tests against.
+-----------------------------------------------------------
 {{source_file_numbered}}
+-----------------------------------------------------------
 
 ## Test File
 Here is the file that contains the existing tests.
+-----------------------------------------------------------
 {{test_file}}
+-----------------------------------------------------------
     """
     test_template = """
 Please generate test for `{{method_name}} to cover the path
 {{selected_path_for_method}}
+-----------------------------------------------------------
     """
     jenv = jinja2.Environment()
     test_prompt = []
@@ -230,28 +344,111 @@ Please generate test for `{{method_name}} to cover the path
 
 ## Methods Under Test
 """ + "\n".join(test_prompt)
-    user_prompt = jenv.from_string(prompt_template).render(source_file_numbered=src_numbered, test_file=test_file)
+    user_prompt = jenv.from_string(prompt_template).render(source_file_numbered="\n".join(src_numbered), test_file=test_file)
     user_prompt = user_prompt + test_prompt
     # print("="*60)
     # print(test_prompt)
     # print("="*60)
     # print(selected_paths)
     system_prompt = "You are an expert Python test-driven developer"
+    file_output_path = log_dir / f"prompt.txt"
+    with open(file_output_path, "w") as f:
+        f.write(user_prompt)
     return {"system": system_prompt, "user": user_prompt}
 
 
-def generate_test_by_prompt_llm(prompt, iter):
+def generate_test_by_prompt_llm(prompt, log_dir, iter):
     llm_invoker =  LLMInvocation("gpt-4o-2024-08-06")
     response, prompt_token_count, response_token_count = llm_invoker.call_model(prompt)
     token_count = prompt_token_count + response_token_count
+    response_path = log_dir / "response.txt"
+    with open(response_path, "w") as f:
+        f.write(response)
 
-    # response = """
-# This is the dummy response
-# ```python
-# def test_assert():
-    # assert 2 == 1+1
-# ```
-    # """
+    if False:
+        response = """
+This is the dummy response
+```python
+def test_pass():
+    assert 2 == 1+1
+def test_fail():
+    assert 2 == 1-1
+```
+        """
+
+        if iter == 1:
+            response = '''
+To enhance the test coverage for the `read_table_fits` function, we need to focus on the specific paths and conditions within the function. The paths we want to cover are:
+
+1. When the input is an `HDUList` and contains multiple tables.
+2. When the input is an `HDUList` and contains a single table.
+3. When the input is an `HDUList` but contains no tables, which should raise a `ValueError`.
+
+Here are the test cases that cover these scenarios:
+
+```python
+import pytest
+import numpy as np
+from astropy.io.fits import HDUList, BinTableHDU, PrimaryHDU
+from astropy.table import Table
+from astropy.utils.exceptions import AstropyUserWarning
+
+def test_read_table_fits_multiple_tables(tmp_path):
+    # Create an HDUList with multiple tables
+    data1 = np.array([(1, 'a'), (2, 'b')], dtype=[('col1', int), ('col2', 'U1')])
+    data2 = np.array([(3, 'c'), (4, 'd')], dtype=[('col3', int), ('col4', 'U1')])
+    hdu1 = BinTableHDU(data1, name='FIRST')
+    hdu2 = BinTableHDU(data2, name='SECOND')
+    hdulist = HDUList([PrimaryHDU(), hdu1, hdu2])
+
+    # Write to a temporary file
+    filename = tmp_path / "test_multiple_tables.fits"
+    hdulist.writeto(filename, overwrite=True)
+
+    # Read the table without specifying HDU
+    with pytest.warns(AstropyUserWarning, match="hdu= was not specified but multiple tables are present"):
+        table = Table.read(filename)
+    assert np.all(table['col1'] == data1['col1'])
+    assert np.all(table['col2'] == data1['col2'])
+
+def test_read_table_fits_single_table(tmp_path):
+    # Create an HDUList with a single table
+    data = np.array([(1, 'a'), (2, 'b')], dtype=[('col1', int), ('col2', 'U1')])
+    hdu = BinTableHDU(data, name='ONLY')
+    hdulist = HDUList([PrimaryHDU(), hdu])
+
+    # Write to a temporary file
+    filename = tmp_path / "test_single_table.fits"
+    hdulist.writeto(filename, overwrite=True)
+
+    # Read the table without specifying HDU
+    table = Table.read(filename)
+    assert np.all(table['col1'] == data['col1'])
+    assert np.all(table['col2'] == data['col2'])
+
+def test_read_table_fits_no_table(tmp_path):
+    # Create an HDUList with no tables
+    hdulist = HDUList([PrimaryHDU()])
+
+    # Write to a temporary file
+    filename = tmp_path / "test_no_table.fits"
+    hdulist.writeto(filename, overwrite=True)
+
+    # Attempt to read the table should raise ValueError
+    with pytest.raises(ValueError, match="No table found"):
+        Table.read(filename)
+```
+
+### Explanation:
+
+1. **`test_read_table_fits_multiple_tables`**: This test creates an `HDUList` with multiple tables and checks if the first table is read by default, emitting a warning about multiple tables being present.
+
+2. **`test_read_table_fits_single_table`**: This test creates an `HDUList` with a single table and verifies that the table is read correctly without any warnings.
+
+3. **`test_read_table_fits_no_table`**: This test creates an `HDUList` with no tables and ensures that attempting to read it raises a `ValueError` with the message "No table found".
+
+These tests should cover the specified paths in the `read_table_fits` function, ensuring that the function behaves as expected in these scenarios.
+            '''
 
     response_list = response.split('\n')
     started = False
@@ -277,6 +474,10 @@ def write_to_test_file(container, log_dir, test_file, test_content, logger):
     copy_to_container(container, new_test_file, PurePosixPath(test_file))
 
 def add_tests_to_test_file(container, log_dir, codeblock, src_file, test_file, test_content, logger):
+    file_output_path = log_dir / f"new_{test_file.replace('/','__')}"
+    with open(file_output_path, "w") as f:
+        f.write(codeblock)
+        logger.info(f"Generated tests for {src_file} written to {file_output_path}")
     your_module = src_file.split('.py')[0].replace('/','.')
     codeblock = codeblock.replace('your_module', your_module)
     new_test_content = test_content + '\n' + codeblock
@@ -287,7 +488,7 @@ def add_tests_to_test_file(container, log_dir, codeblock, src_file, test_file, t
 def reset_test_file(container, log_dir, test_file, test_content, logger):
     write_to_test_file(container, log_dir, test_file, test_content, logger)
 
-def generate_tests(container, instance, log_dir, src_file, src, test_file, tests, timeout, logger):
+def generate_tests(container, dataset_name, split, instance, test_spec, log_dir, src_file, src, test_file, tests, timeout, logger):
     instance_id = instance['instance_id']
     ## TODO: testDeps = extractDependenciesForTestScope()
     iter, iter_no_increase = 0, 0
@@ -295,25 +496,35 @@ def generate_tests(container, instance, log_dir, src_file, src, test_file, tests
     # failedTestFeedback = []
     # methodDict = Algorithm 1 (srcFile)
     # TODO: maxCYC = getMaxComplexity(methodDict)
-    cur_cov_report = run_tests_and_get_coverage(container, instance, log_dir, timeout, logger)
-    cur_coverage = cur_cov_report['files'][src_file]['summary']['percent_covered']
-    # TODO: add conditional: iter < maxCYC
+    maxCYC = 10
+    maxNoIncreaseLimit = 3
+    test_output_path = run_tests(container, instance, log_dir, timeout, logger, patch_coverage=True)
+    cur_cov_report = get_coverage(container, instance, log_dir, timeout, logger)
+    try:
+        cur_coverage = cur_cov_report['files'][src_file]['summary']['percent_covered']
+    except KeyError:
+        logger.error(f"Coverage of src file {src_file} not found")
+        return
     logger.info(f"cur_coverage: {cur_coverage}")
-    while iter_no_increase < maxNoIncreaseLimit and iter < 10 and math.ceil(cur_coverage) < 100:
-        selected_paths = select_uncovered_paths(cur_cov_report, src_file, src, path_history, logger)
-        src_numbered = get_lined_source(src)
-        prompt = build_prompt(src_numbered, tests, selected_paths)
-        response, codeblock = generate_test_by_prompt_llm(prompt, iter)
+    while iter_no_increase < maxNoIncreaseLimit and iter < maxCYC and math.ceil(cur_coverage) < 100:
+        # logger.info(src)
         _log_dir = log_dir / str(iter)
         _log_dir.mkdir(parents=True, exist_ok=True)
-        file_output_path = _log_dir / f"new_{test_file.replace('/','__')}"
-        with open(file_output_path, "w") as f:
-            f.write(codeblock)
-            logger.info(f"Generated tests for {src_file} written to {file_output_path}")
+        selected_paths = select_uncovered_paths(cur_cov_report, src_file, src, path_history, logger)
+        src_numbered = get_lined_source(src)
+        prompt = build_prompt(src_numbered, tests, selected_paths, _log_dir)
+        response, codeblock = generate_test_by_prompt_llm(prompt, _log_dir, iter)
         new_tests = add_tests_to_test_file(container, _log_dir, codeblock, src_file, test_file, tests, logger )
-        new_cov_report = run_tests_and_get_coverage(container, instance, _log_dir, timeout, logger)
+        test_output_path = run_tests(container, instance, _log_dir, timeout, logger)
+        new_codeblock = get_successful_tests(container, dataset_name, split, instance, test_spec, test_file, codeblock, test_output_path, log_dir, timeout, logger)
+
+        new_tests = add_tests_to_test_file(container, _log_dir, new_codeblock, src_file, test_file, tests, logger )
+        test_output_path = run_tests(container, instance, _log_dir, timeout, logger)
+        new_cov_report = get_coverage(container, instance, _log_dir, timeout, logger)
         new_coverage = new_cov_report['files'][src_file]['summary']['percent_covered']
         logger.info(f"{iter} new_coverage: {new_coverage}")
+        # print(new_tests)
+
         if new_coverage <= cur_coverage:
             reset_test_file(container, _log_dir, test_file, tests, logger)
         else:
@@ -349,7 +560,6 @@ def main(
     instance_image_tag: str = "latest",
     report_dir: str = ".",
 ):
-    # instance_id = test_spec.instance_id
     log_dir = TESTENHANCER_LOG_DIR / run_id / instance_id
 
     # Set up logger
@@ -458,7 +668,7 @@ def main(
             src = get_file_output(src_file, file_output_path)
             file_output_path = log_dir / f"{test_file.replace('/','__')}"
             tests = get_file_output(test_file, file_output_path)
-            generate_tests(container, instance, log_dir, src_file, src, test_file, tests, timeout, logger)
+            generate_tests(container, dataset_name, split, instance, test_spec, log_dir, src_file, src, test_file, tests, timeout, logger)
 
     except BuildImageError as e:
         error_msg = traceback.format_exc()
