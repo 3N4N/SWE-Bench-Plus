@@ -324,17 +324,19 @@ def make_test_spec(
     else:
         arch = "x86_64"
 
-    def get_modified_files(diff_text: str):
-        modified_files = []
-        for header in re.finditer(r"^diff --git a/(.+?) b/\1", diff_text, re.MULTILINE):
-            file_path = header.group(1)
-            # Ensure file is not marked as new or deleted
-            context_start = diff_text.find(header.group(0))
-            context = diff_text[context_start: context_start + 200]  # look ahead
-            if "new file mode" not in context and "deleted file mode" not in context:
-                modified_files.append(file_path)
-        return modified_files
-    test_files = get_modified_files(instance['test_patch'])
+    test_files = re.findall(r'^diff --git a/(.*?) b/', instance['test_patch'], flags=re.MULTILINE)
+
+    # def get_modified_files_from_patch(diff_text: str):
+    #     modified_files = []
+    #     for header in re.finditer(r"^diff --git a/(.+?) b/\1", diff_text, re.MULTILINE):
+    #         file_path = header.group(1)
+    #         # Ensure file is not marked as new or deleted
+    #         context_start = diff_text.find(header.group(0))
+    #         context = diff_text[context_start: context_start + 200]  # look ahead
+    #         if "new file mode" not in context and "deleted file mode" not in context:
+    #             modified_files.append(file_path)
+    #     return modified_files
+    # test_files = get_modified_files_from_patch(instance['test_patch'])
 
     # print("-"*10, repo)
     # for test_file in test_files:
@@ -351,7 +353,7 @@ def make_test_spec(
 
     add_test_enhancer_patches = False
 
-    if False:
+    if add_test_enhancer_patches:
         HEREDOC_DELIMITER = "EOF_114329324912"
         update_test_file_command = list()
         new_fail_to_pass = list()
@@ -381,7 +383,8 @@ def make_test_spec(
         if max_cov > cur_cov:
             add_test_enhancer_patches = True
         else:
-            print("Not adding TestEnhancer patches")
+            add_test_enhancer_patches = False
+            print(f"{instance_id}: Not adding TestEnhancer patches")
         test_files = []
 
     if add_test_enhancer_patches:

@@ -53,6 +53,7 @@ from swebench.harness.utils import (
     str2bool,
     optional_str,
 )
+from swebench.harness.utils import get_modified_files
 from swebench.harness.grading import get_eval_report
 from swebench.harness.run_evaluation import GIT_APPLY_CMDS
 from swebench.harness.test_spec.test_spec import extract_test_headers, get_node
@@ -63,32 +64,26 @@ from swebench.test_enhancer.path_approx import get_mut_paths, pairwise
 from swebench.test_enhancer.path_selection import select_uncovered_paths
 from swebench.test_enhancer.llm_invocation import LLMInvocation
 
-def run_tests(container, instance, log_dir, timeout, logger, patch_coverage=False):
-    instance_id = instance['instance_id']
-    log_dir.mkdir(parents=True, exist_ok=True)
+HEREDOC_DELIMITER = "EOF_114329324913"
+
+def reset_repo(container, instance, timeout, logger):
     env_name = "testbed"
     repo_directory = f"/{env_name}"
-    specs = MAP_REPO_VERSION_TO_SPECS[instance['repo']][instance['version']]
-
-    HEREDOC_DELIMITER = "EOF_114329324913"
-    # reset_tests_command = f"git checkout {base_commit} {' '.join(test_files)}"
-    test_command = " ".join(
-        [
-            MAP_REPO_VERSION_TO_SPECS[instance["repo"]][instance["version"]][
-                "test_cmd"
-            ],
-            *get_test_directives(instance),
-        ]
+    output, timed_out, total_runtime = exec_run_with_timeout(
+        container, f"git -C {repo_directory} reset --hard {instance['base_commit']}", timeout
     )
-    eval_commands = [
-        "source /opt/miniconda3/bin/activate",
-        f"conda activate {env_name}",
-        f"cd {repo_directory}",
-    ]
-    if patch_coverage and instance['repo'] == "django/django" and float(instance['version']) < 4.0 :
-        coverage_command = "coverage json -o coverage.json"
-        coverage_install = "python --version && python -m pip install -U pip\npip install -U 'coverage==6.2'"
-        coverage_patch = '''
+    if timed_out:
+        raise EvaluationError(
+            instance['instance_id'],
+            f"reset_repo timed out after {timeout} seconds.",
+            logger,
+        )
+    else:
+        logger.info(f"Repo reset to {instance['base_commit']}")
+        logger.info(output)
+
+def patch_coverage(container, instance, timeout, logger):
+    coverage_patch = '''
 diff --git a/coverage/jsonreport.py b/coverage/jsonreport.py
 index 43edc4520..7ca468e32 100644
 --- a/coverage/jsonreport.py
@@ -111,13 +106,53 @@ index 43edc4520..7ca468e32 100644
 +    for source, targets in branch_arcs.items():
 +        for target in targets:
 +            yield source, target if target != -1 else 0
-        '''
-        coverage_apply_patch_command = "\n".join(
-            "pushd $(python -c 'from distutils.sysconfig import get_python_lib; print(get_python_lib())')",
-            f"git apply -v - <<'{HEREDOC_DELIMITER}'\n{coverage_patch}\n{HEREDOC_DELIMITER}"
-            "popd",
+    '''
+
+    coverage_apply_patch_command = " && ".join([
+        "pushd $(python -c 'from distutils.sysconfig import get_python_lib; print(get_python_lib())')",
+        f"git apply -v - <<'{HEREDOC_DELIMITER}'\n{coverage_patch}\n{HEREDOC_DELIMITER}\n"
+        "popd",
+    ])
+    output, timed_out, total_runtime = exec_run_with_timeout(
+        container, coverage_apply_patch_command, timeout
+    )
+    if timed_out:
+        raise EvaluationError(
+            instance['instance_id'],
+            f"patch_coverage timed out after {timeout} seconds.",
+            logger,
         )
-    elif patch_coverage and instance['repo'] == "django/django":
+
+def run_tests(container, instance, log_dir, timeout, logger): #, patch_coverage=False):
+    instance_id = instance['instance_id']
+    log_dir.mkdir(parents=True, exist_ok=True)
+    env_name = "testbed"
+    repo_directory = f"/{env_name}"
+    specs = MAP_REPO_VERSION_TO_SPECS[instance['repo']][instance['version']]
+
+    # test_files = get_modified_files(instance['test_patch'])
+    # reset_tests_command = f"git checkout {instane['base_commit']} {' '.join(test_files)}"
+    apply_test_patch_command = (
+        f"git apply -v - <<'{HEREDOC_DELIMITER}'\n{instance['test_patch']}\n{HEREDOC_DELIMITER}"
+    )
+    test_command = " ".join(
+        [
+            MAP_REPO_VERSION_TO_SPECS[instance["repo"]][instance["version"]][
+                "test_cmd"
+            ],
+            *get_test_directives(instance),
+        ]
+    )
+    eval_commands = [
+        "source /opt/miniconda3/bin/activate",
+        f"conda activate {env_name}",
+        f"cd {repo_directory}",
+    ]
+    if ((instance['repo'] == "django/django" and float(instance['version']) < 4.0) or (instance['repo'] == 'scikit-learn/scikit-learn' and float(instance['version']) < 1.0) ):
+        coverage_command = "coverage json -o coverage.json"
+        coverage_install = "python --version && python -m pip install -U pip\npython -m pip install -U 'coverage==6.2'"
+        coverage_apply_patch_command = ""
+    elif instance['repo'] == "django/django":
         coverage_command = "coverage json -o coverage.json"
         coverage_install = "python --version\npip install -U coverage"
         coverage_apply_patch_command = ""
@@ -125,23 +160,38 @@ index 43edc4520..7ca468e32 100644
         coverage_command = "coverage json -o coverage.json"
         coverage_install = "python --version\npip install -U coverage\ncoverage --version"
         coverage_apply_patch_command = ""
+    # elif instance['repo'] == 'pytest-dev/pytest':
+    #     coverage_command = "coverage json -o coverage.json"
+    #     coverage_install = "python --version\npip install -U coverage\ncoverage --version"
+    #     coverage_apply_patch_command = ""
     elif instance['repo'] == 'sphinx-doc/sphinx':
         coverage_command = ""
         coverage_install = ""
         coverage_apply_patch_command = "sed -i -e 's/ pytest / pytest --cov --cov-branch --cov-report json /g' tox.ini"
+    elif instance['repo'] in [ 'psf/requests', 'pytest-dev/pytest', ]:
+        coverage_command = ""
+        coverage_install = "python -m pip install pytest-cov ."
+        coverage_apply_patch_command = ""
+    # elif instance['repo'] == 'scikit-learn/scikit-learn' :
+    #     coverage_command = ""
+    #     coverage_install = "python -m pip install -U pip\npython -m pip install 'pytest-cov>=4.1.0'\npython --version\npytest --version"
+    #     coverage_apply_patch_command = ""
     else:
         coverage_command = ""
         coverage_install = ""
         coverage_apply_patch_command = ""
     eval_commands += [
-        # reset_tests_command,  # Revert tests after done, leave the repo in the same state as before
+        # reset_tests_command,
         coverage_install,
+        # apply_test_patch_command,
         coverage_apply_patch_command,
         f": '{START_TEST_OUTPUT}'",
         test_command,
         coverage_command,
         f": '{END_TEST_OUTPUT}'",
-        # reset_tests_command,  # Revert tests after done, leave the repo in the same state as before
+        # "cat -n astropy/io/fits/connect.py",
+        # "cat -n astropy/io/fits/tests/test_connect.py",
+        # reset_tests_command,
     ]
 
     test_script = "\n".join(["#!/bin/bash", "set -uxo pipefail"] + eval_commands) + "\n"
@@ -194,75 +244,94 @@ import ast
 from pathlib import Path
 from typing import Dict, Set, Tuple, Union, Iterable
 
-def parse_targets(targets: Iterable[str]) -> Tuple[Set[str], Dict[str, Set[str]]]:
-    funcs: Set[str] = set()
-    methods: Dict[str, Set[str]] = {}
-    for t in targets:
-        if "." in t:
-            cls, meth = t.split(".", 1)
-            methods.setdefault(cls, set()).add(meth)
+def remove_functions_from_file(source: str, names_to_remove: Iterable[str]) -> str:
+    """
+    Remove standalone functions and class methods from `source`.
+    If a class ends up with no methods, remove the class entirely.
+
+    `names_to_remove` can include:
+      - bare function names, e.g., "foo"
+      - method names, e.g., "bar" (removes any method named bar in any class)
+      - fully qualified methods, e.g., "MyClass.baz" (only that class' method)
+
+    Returns the modified source code as a string.
+    """
+    to_remove: Set[str] = set(names_to_remove)
+
+    # Split into plain names and fully-qualified Class.method names
+    plain_funcs: Set[str] = set()
+    class_to_methods: Dict[str, Set[str]] = {}
+    for name in to_remove:
+        if "." in name:
+            cls, meth = name.split(".", 1)
+            class_to_methods.setdefault(cls, set()).add(meth)
         else:
-            funcs.add(t)
-    return funcs, methods
+            plain_funcs.add(name)
 
-def remove_functions_from_ast(tree: ast.Module,
-                              top_funcs: Set[str],
-                              class_methods: Dict[str, Set[str]]) -> ast.Module:
-    def is_func(node): return isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    class Remover(ast.NodeTransformer):
+        def visit_Module(self, node: ast.Module):
+            new_body = []
+            for n in node.body:
+                n = self.visit(n)
+                if n is None:
+                    continue
+                # Keep lists flattened if any transformer returns a list (we won't here).
+                if isinstance(n, list):
+                    new_body.extend(n)
+                else:
+                    new_body.append(n)
+            node.body = new_body
+            return node
 
-    def prune_class(cnode: ast.ClassDef) -> ast.ClassDef:
-        new_body = []
-        for n in cnode.body:
-            # remove direct methods whose names match
-            if is_func(n) and n.name in class_methods.get(cnode.name, set()):
-                continue
-            # recurse into nested classes
-            if isinstance(n, ast.ClassDef):
-                new_body.append(prune_class(n))
-            else:
+        def visit_FunctionDef(self, node: ast.FunctionDef):
+            # Remove top-level function if name matches plain list
+            return None if node.name in plain_funcs else node
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
+            # Remove top-level async function if name matches plain list
+            return None if node.name in plain_funcs else node
+
+        def visit_ClassDef(self, node: ast.ClassDef):
+            # Collect original method names
+            method_nodes = [n for n in node.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+            original_methods = {n.name for n in method_nodes}
+
+            # Which methods of this class should we remove?
+            targeted_by_class = class_to_methods.get(node.name, set())
+            # Remove if method name matches either the class-specific list OR the plain method names
+            remove_names = (original_methods & targeted_by_class) | (original_methods & plain_funcs)
+
+            # Filter the class body
+            new_body = []
+            for n in node.body:
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if n.name in remove_names:
+                        continue  # drop this method
                 new_body.append(n)
-        cnode.body = new_body
-        return cnode
 
-    new_body = []
-    for node in tree.body:
-        # remove top-level functions
-        if is_func(node) and node.name in top_funcs:
-            continue
-        # prune class methods
-        if isinstance(node, ast.ClassDef):
-            new_body.append(prune_class(node))
-        else:
-            new_body.append(node)
-    tree.body = new_body
-    return tree
+            # If the class has no methods left, remove the whole class
+            has_any_method_left = any(isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) for n in new_body)
+            if not has_any_method_left:
+                return None
 
-def remove_functions_from_file(src, targets):
-    tree = ast.parse(src)
-    top_funcs, class_methods = parse_targets(targets)
-    tree = remove_functions_from_ast(tree, top_funcs, class_methods)
+            node.body = new_body
+            return node
 
+    tree = ast.parse(source)
+    new_tree = Remover().visit(tree)
+    ast.fix_missing_locations(new_tree)
+
+    # Use ast.unparse if available (Python 3.9+). Fallback to astor if needed.
     try:
-        new_src = ast.unparse(tree)  # Python 3.9+
+        new_source = ast.unparse(new_tree)  # type: ignore[attr-defined]
     except AttributeError:
         import astor  # pip install astor
-        new_src = astor.to_source(tree)
-    new_src_split = new_src.split('\n')
+        new_source = astor.to_source(new_tree)
 
-    new_src = []
-    for i in range(len(new_src_split)):
-        if new_src_split[i].startswith('class'):
-            if (i != len(new_src_split) - 1) and (len(new_src_split[i+1])>0) and (new_src_split[i+1][0]==' '):
-                new_src.append(new_src_split[i])
-        else:
-            new_src.append(new_src_split[i])
+    return new_source
 
-    new_src = "\n".join(new_src)
-    return new_src
-
-def get_successful_tests(container, dataset_name, split, instance,
-               test_spec, test_file, test_content, test_output_path,
-               log_dir, timeout, logger):
+def get_list_of_successful_and_failed_tests(container, dataset_name, split, instance,
+                                            test_spec, test_file, test_content, test_output_path):
     instance_id = instance['instance_id']
     repo = instance['repo']
     test_headers = extract_test_headers(repo, test_file, test_content)
@@ -281,48 +350,50 @@ def get_successful_tests(container, dataset_name, split, instance,
     tests_failure = report[instance_id]['tests_status']['FAIL_TO_PASS']['failure']
     new_tests_success = [ test for test in test_headers if test in tests_success ]
     new_tests_failure = [ test for test in test_headers if test in tests_failure ]
+    return new_tests_success, new_tests_failure
+
+
+def get_successful_tests(container, dataset_name, split, instance,
+               test_spec, test_file, test_content, test_output_path,
+               log_dir, timeout, logger):
+    _, new_tests_failure = get_list_of_successful_and_failed_tests(container, dataset_name, split, instance,
+               test_spec, test_file, test_content, test_output_path)
+    instance_id = instance['instance_id']
+    repo = instance['repo']
     to_remove = [ get_node(repo, test_file, test) for test in new_tests_failure ]
     to_remove = [ entry for entry in to_remove if entry is not None ]
-    logger.info(f"Remove targets: {to_remove}")
+    logger.info(f"Remove failed targets: {to_remove}")
     if to_remove is not None and len(to_remove) > 0:
         correct_test_content = remove_functions_from_file(test_content, to_remove)
+        # logger.info(correct_test_content)
     else:
         correct_test_content = test_content
     return correct_test_content
 
-def build_prompt(src_numbered, test_file, selected_paths, log_dir):
-    prompt_template = """
-## Overview
-You are an expert software engineer code assistant tasked with generating additional unit tests for a Java source file and its corresponding test file.
-Your objective is to enhance both line coverage and branch coverage by adding new unit tests to the existing test suite.
+def get_failed_tests(container, dataset_name, split, instance, 
+               test_spec, test_file, test_content, test_output_path,
+               log_dir, timeout, logger):
+    new_tests_success, _ = get_list_of_successful_and_failed_tests(container, dataset_name, split, instance,
+               test_spec, test_file, test_content, test_output_path)
+    instance_id = instance['instance_id']
+    repo = instance['repo']
+    to_remove = [ get_node(repo, test_file, test) for test in new_tests_success ]
+    to_remove = [ entry for entry in to_remove if entry is not None ]
+    logger.info(f"Remove passed targets: {to_remove}")
+    if to_remove is not None and len(to_remove) > 0:
+        correct_test_content = remove_functions_from_file(test_content, to_remove)
+        # logger.info(correct_test_content)
+    else:
+        correct_test_content = test_content
+    return correct_test_content
 
-### Guidelines:
-1. Analyze the Code: Examine the provided source code to understand its functionality, inputs, outputs, and core logic.
-2. Identify Test Cases: Develop a detailed list of test cases that will fully validate the source code and achieve 100% line coverage and branch coverage.
-3. Add and Review Tests: Integrate individual tests ensuring they collectively cover all possible scenarios, including edge cases and exception handling.
-4. Maintain Consistency: Ensure new tests are consistent with the existing test suite in terms of style, naming conventions, and structure. Assume new tests are part of the same suite if a test suite exists.
-
-## Source File
-Here is the source file that you will be writing tests against.
-We have manually added line numbers to assist in understanding the code coverage.
-These line numbers are not part of the original code.
-
------------------------------------------------------------
-{{source_file_numbered}}
------------------------------------------------------------
-
-## Test File
-Here is the file that contains the existing tests.
------------------------------------------------------------
-{{test_file}}
------------------------------------------------------------
-    """
+def build_prompt(src_file, src_numbered, test_file, test_content, selected_paths, log_dir):
     test_template = """
-Please generate test for `{{method_name}} to cover the path
+Please generate test for `{{method_name}}` to cover the path
 {{selected_path_for_method}}
 -----------------------------------------------------------
     """
-    jenv = jinja2.Environment()
+    jenv = jinja2.Environment(loader=jinja2.FileSystemLoader("swebench/test_enhancer/templates/"))
     test_prompt = []
     for method, paths in selected_paths.items():
         for path in paths:
@@ -340,11 +411,17 @@ Please generate test for `{{method_name}} to cover the path
             path_src = "\n".join(path_src)
             _test_prompt = jenv.from_string(test_template).render(method_name=method, selected_path_for_method=path_src)
             test_prompt.append(_test_prompt)
+    if len(test_prompt) == 0:
+        _test_prompt = "Please generated tests for the whole source file given above"
+        test_prompt.append(_test_prompt)
     test_prompt = """
 
 ## Methods Under Test
 """ + "\n".join(test_prompt)
-    user_prompt = jenv.from_string(prompt_template).render(source_file_numbered="\n".join(src_numbered), test_file=test_file)
+    user_prompt = jenv.get_template("python_base.txt").render(
+        source_file=src_file, source_numbered="\n".join(src_numbered),
+        test_file=test_file, test_content=test_content
+    )
     user_prompt = user_prompt + test_prompt
     # print("="*60)
     # print(test_prompt)
@@ -357,8 +434,9 @@ Please generate test for `{{method_name}} to cover the path
     return {"system": system_prompt, "user": user_prompt}
 
 
-def generate_test_by_prompt_llm(prompt, log_dir, iter):
-    llm_invoker =  LLMInvocation("gpt-4o-2024-08-06")
+def generate_test_by_prompt_llm(model, prompt, log_dir, iter):
+
+    llm_invoker =  LLMInvocation(model)
     response, prompt_token_count, response_token_count = llm_invoker.call_model(prompt)
     token_count = prompt_token_count + response_token_count
     response_path = log_dir / "response.txt"
@@ -366,6 +444,7 @@ def generate_test_by_prompt_llm(prompt, log_dir, iter):
         f.write(response)
 
     if False:
+
         response = """
 This is the dummy response
 ```python
@@ -376,7 +455,7 @@ def test_fail():
 ```
         """
 
-        if iter == 1:
+        if iter == 0:
             response = '''
 To enhance the test coverage for the `read_table_fits` function, we need to focus on the specific paths and conditions within the function. The paths we want to cover are:
 
@@ -471,7 +550,10 @@ def write_to_test_file(container, log_dir, test_file, test_content, logger):
     logger.info(
         f"Writing to test file {new_test_file}, now applying to container..."
     )
-    copy_to_container(container, new_test_file, PurePosixPath(test_file))
+    try:
+        copy_to_container(container, new_test_file, PurePosixPath(test_file))
+    except ValueError:
+        logger.info(f"copy_to_container error: {new_test_file} -> {PurePosixPath(test_file)}")
 
 def add_tests_to_test_file(container, log_dir, codeblock, src_file, test_file, test_content, logger):
     file_output_path = log_dir / f"new_{test_file.replace('/','__')}"
@@ -488,7 +570,7 @@ def add_tests_to_test_file(container, log_dir, codeblock, src_file, test_file, t
 def reset_test_file(container, log_dir, test_file, test_content, logger):
     write_to_test_file(container, log_dir, test_file, test_content, logger)
 
-def generate_tests(container, dataset_name, split, instance, test_spec, log_dir, src_file, src, test_file, tests, timeout, logger):
+def generate_tests(model, container, dataset_name, split, instance, test_spec, log_dir, src_file, src, test_file, tests, timeout, logger):
     instance_id = instance['instance_id']
     ## TODO: testDeps = extractDependenciesForTestScope()
     iter, iter_no_increase = 0, 0
@@ -498,25 +580,53 @@ def generate_tests(container, dataset_name, split, instance, test_spec, log_dir,
     # TODO: maxCYC = getMaxComplexity(methodDict)
     maxCYC = 10
     maxNoIncreaseLimit = 3
-    test_output_path = run_tests(container, instance, log_dir, timeout, logger, patch_coverage=True)
+
+    patch_coverage(container, instance, timeout, logger)
+
+    reset_repo(container, instance, timeout, logger)
+    apply_gold_patch(container, instance, log_dir, logger)
+    # apply_test_patch(container, instance, log_dir, logger)
+    reset_test_file(container, log_dir, test_file, tests, logger)
+
+    test_output_path = run_tests(container, instance, log_dir, timeout, logger) #, patch_coverage=True)
     cur_cov_report = get_coverage(container, instance, log_dir, timeout, logger)
+
     try:
         cur_coverage = cur_cov_report['files'][src_file]['summary']['percent_covered']
     except KeyError:
-        logger.error(f"Coverage of src file {src_file} not found")
-        return
+        logger.error(f"Coverage of src file {src_file} not found. Setting to 0.")
+        cur_coverage = 0.0
     logger.info(f"cur_coverage: {cur_coverage}")
+
+    # selected_paths = select_uncovered_paths(cur_cov_report, src_file, src, path_history, logger)
+    # print(selected_paths)
+    # return
+
     while iter_no_increase < maxNoIncreaseLimit and iter < maxCYC and math.ceil(cur_coverage) < 100:
-        # logger.info(src)
         _log_dir = log_dir / str(iter)
         _log_dir.mkdir(parents=True, exist_ok=True)
         selected_paths = select_uncovered_paths(cur_cov_report, src_file, src, path_history, logger)
         src_numbered = get_lined_source(src)
-        prompt = build_prompt(src_numbered, tests, selected_paths, _log_dir)
-        response, codeblock = generate_test_by_prompt_llm(prompt, _log_dir, iter)
-        new_tests = add_tests_to_test_file(container, _log_dir, codeblock, src_file, test_file, tests, logger )
+
+        prompt = build_prompt(src_file, src_numbered, test_file, tests, selected_paths, _log_dir)
+        response, codeblock = generate_test_by_prompt_llm(model, prompt, _log_dir, iter)
+
+        if True:        # conditional for devel purposes
+            # get FAILED tests on buggy repo
+            reset_repo(container, instance, timeout, logger)
+            # apply_test_patch(container, instance, log_dir, logger)
+            reset_test_file(container, _log_dir, test_file, tests, logger)
+            new_tests = add_tests_to_test_file(container, _log_dir, codeblock, src_file, test_file, tests, logger )
+            test_output_path = run_tests(container, instance, _log_dir, timeout, logger)
+            new_codeblock = get_failed_tests(container, dataset_name, split, instance, test_spec, test_file, codeblock, test_output_path, log_dir, timeout, logger)
+        else:
+            new_codeblock = codeblock
+
+        # get PASSED tests after applying gold patch
+        apply_gold_patch(container, instance, log_dir, logger)
+        new_tests = add_tests_to_test_file(container, _log_dir, new_codeblock, src_file, test_file, tests, logger )
         test_output_path = run_tests(container, instance, _log_dir, timeout, logger)
-        new_codeblock = get_successful_tests(container, dataset_name, split, instance, test_spec, test_file, codeblock, test_output_path, log_dir, timeout, logger)
+        new_codeblock = get_successful_tests(container, dataset_name, split, instance, test_spec, test_file, new_codeblock, test_output_path, log_dir, timeout, logger)
 
         new_tests = add_tests_to_test_file(container, _log_dir, new_codeblock, src_file, test_file, tests, logger )
         test_output_path = run_tests(container, instance, _log_dir, timeout, logger)
@@ -525,12 +635,13 @@ def generate_tests(container, dataset_name, split, instance, test_spec, log_dir,
         logger.info(f"{iter} new_coverage: {new_coverage}")
         # print(new_tests)
 
-        if new_coverage <= cur_coverage:
-            reset_test_file(container, _log_dir, test_file, tests, logger)
-        else:
+        if new_coverage > cur_coverage:
             tests = new_tests
-        iter_no_increase = 0 if new_coverage > cur_coverage else iter_no_increase + 1
-        cur_coverage = new_coverage
+            cur_coverage = new_coverage
+            iter_no_increase = 0
+        else:
+            iter_no_increase += 1
+
         iter += 1
 
 def get_lined_source(src, range=None):
@@ -546,10 +657,50 @@ def get_lined_source(src, range=None):
         i+=1
     return lines
 
+def apply_patch(container, instance_id, patch_content, log_dir, logger):
+    patch_file = Path(log_dir / "patch.diff")
+    patch_file.write_text(patch_content)
+    logger.info(
+        f"Intermediate patch for {instance_id} written to {patch_file}, now applying to container..."
+    )
+    copy_to_container(container, patch_file, PurePosixPath(DOCKER_PATCH))
+
+    # Attempt to apply patch to container (TODO: FIX THIS)
+    applied_patch = False
+    for git_apply_cmd in GIT_APPLY_CMDS:
+        val = container.exec_run(
+            f"{git_apply_cmd} {DOCKER_PATCH}",
+            workdir=DOCKER_WORKDIR,
+            user=DOCKER_USER,
+        )
+        if val.exit_code == 0:
+            logger.info(f"{APPLY_PATCH_PASS}:\n{val.output.decode(UTF8)}")
+            applied_patch = True
+            break
+        else:
+            logger.info(f"Failed to apply patch to container: {git_apply_cmd}")
+    if not applied_patch:
+        logger.info(f"{APPLY_PATCH_FAIL}:\n{val.output.decode(UTF8)}")
+        raise EvaluationError(
+            instance_id,
+            f"{APPLY_PATCH_FAIL}:\n{val.output.decode(UTF8)}",
+            logger,
+        )
+
+def apply_gold_patch(container, instance, log_dir, logger):
+    patch_content = instance['patch'] # + '\n' + instance['test_patch']
+    apply_patch(container, instance['instance_id'], patch_content, log_dir, logger)
+
+def apply_test_patch(container, instance, log_dir, logger):
+    patch_content = instance['test_patch']
+    apply_patch(container, instance['instance_id'], patch_content, log_dir, logger)
+
+
 def main(
     instance_id,
     dataset_name,
     split,
+    model,
     rm_image: bool,
     force_rebuild: bool,
     client: docker.DockerClient,
@@ -574,17 +725,17 @@ def main(
     src_files = re.findall(r'^diff --git a/(.*?) b/', instance['patch'], flags=re.MULTILINE)
     test_files = re.findall(r'^diff --git a/(.*?) b/', instance['test_patch'], flags=re.MULTILINE)
 
-    def get_modified_files(diff_text: str):
-        modified_files = []
-        for header in re.finditer(r"^diff --git a/(.+?) b/\1", diff_text, re.MULTILINE):
-            file_path = header.group(1)
-            # Ensure file is not marked as new or deleted
-            context_start = diff_text.find(header.group(0))
-            context = diff_text[context_start: context_start + 200]  # look ahead
-            if "new file mode" not in context and "deleted file mode" not in context:
-                modified_files.append(file_path)
-        return modified_files
-    test_files = get_modified_files(instance['test_patch'])
+    # def get_modified_files_from_patch(diff_text: str):
+    #     modified_files = []
+    #     for header in re.finditer(r"^diff --git a/(.+?) b/\1", diff_text, re.MULTILINE):
+    #         file_path = header.group(1)
+    #         # Ensure file is not marked as new or deleted
+    #         context_start = diff_text.find(header.group(0))
+    #         context = diff_text[context_start: context_start + 200]  # look ahead
+    #         if "new file mode" not in context and "deleted file mode" not in context:
+    #             modified_files.append(file_path)
+    #     return modified_files
+    # test_files = get_modified_files_from_patch(instance['test_patch'])
 
     test_spec = make_test_spec(
         instance, namespace=namespace, instance_image_tag=instance_image_tag
@@ -598,43 +749,15 @@ def main(
         container.start()
         logger.info(f"Container for {instance_id} started: {container.id}")
 
-        # Copy golden patch and test patch as patch file to container
-        patch_content = instance['patch'] + '\n' + instance['test_patch']
-        patch_file = Path(log_dir / "patch.diff")
-        patch_file.write_text(patch_content)
-        logger.info(
-            f"Intermediate patch for {instance_id} written to {patch_file}, now applying to container..."
-        )
-        copy_to_container(container, patch_file, PurePosixPath(DOCKER_PATCH))
+        apply_gold_patch(container, instance, log_dir, logger)
+        apply_test_patch(container, instance, log_dir, logger)
 
-        # Attempt to apply patch to container (TODO: FIX THIS)
-        applied_patch = False
-        for git_apply_cmd in GIT_APPLY_CMDS:
-            val = container.exec_run(
-                f"{git_apply_cmd} {DOCKER_PATCH}",
-                workdir=DOCKER_WORKDIR,
-                user=DOCKER_USER,
-            )
-            if val.exit_code == 0:
-                logger.info(f"{APPLY_PATCH_PASS}:\n{val.output.decode(UTF8)}")
-                applied_patch = True
-                break
-            else:
-                logger.info(f"Failed to apply patch to container: {git_apply_cmd}")
-        if not applied_patch:
-            logger.info(f"{APPLY_PATCH_FAIL}:\n{val.output.decode(UTF8)}")
-            raise EvaluationError(
-                instance_id,
-                f"{APPLY_PATCH_FAIL}:\n{val.output.decode(UTF8)}",
-                logger,
-            )
-
-        eval_file = Path(log_dir / "eval.sh")
-        eval_file.write_text(test_spec.eval_script)
-        logger.info(
-            f"Eval script for {instance_id} written to {eval_file}; copying to container..."
-        )
-        copy_to_container(container, eval_file, PurePosixPath("/eval.sh"))
+        # eval_file = Path(log_dir / "eval.sh")
+        # eval_file.write_text(test_spec.eval_script)
+        # logger.info(
+        #     f"Eval script for {instance_id} written to {eval_file}; copying to container..."
+        # )
+        # copy_to_container(container, eval_file, PurePosixPath("/eval.sh"))
 
         def get_file_output(file_path, file_output_path):
             file_output, timed_out, total_runtime = exec_run_with_timeout(
@@ -668,7 +791,7 @@ def main(
             src = get_file_output(src_file, file_output_path)
             file_output_path = log_dir / f"{test_file.replace('/','__')}"
             tests = get_file_output(test_file, file_output_path)
-            generate_tests(container, dataset_name, split, instance, test_spec, log_dir, src_file, src, test_file, tests, timeout, logger)
+            generate_tests(model, container, dataset_name, split, instance, test_spec, log_dir, src_file, src, test_file, tests, timeout, logger)
 
     except BuildImageError as e:
         error_msg = traceback.format_exc()
@@ -762,6 +885,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--instance_id", type=str, required=True, help="Instance ID",
     )
+    parser.add_argument(
+        "--model", type=str, default="gpt-4o-2024-08-06",
+        help="LLM model to generate new tests",
+    )
     args = parser.parse_args()
 
     # run instances locally
@@ -774,6 +901,7 @@ if __name__ == "__main__":
         args.instance_id,
         args.dataset_name,
         args.split,
+        args.model,
         False,
         args.force_rebuild,
         client,
