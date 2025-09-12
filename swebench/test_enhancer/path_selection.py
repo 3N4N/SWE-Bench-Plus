@@ -50,6 +50,7 @@ from swebench.harness.utils import (
 )
 from swebench.harness.test_spec.test_spec import make_test_spec, TestSpec
 from swebench.test_enhancer.path_approx import get_mut_paths, pairwise
+from swebench.harness.run_evaluation import GIT_APPLY_CMDS
 
 MAX_SELECTED_CONST = 10
 
@@ -63,17 +64,20 @@ def select_uncovered_paths(cov_report, src_file, src, path_history, logger):
     missed_lines = cov_report['files'][key_file]['missing_lines']
     missed_branches = cov_report['files'][key_file]['missing_branches']
 
-    print(missed_lines)
-    print(missed_branches)
+    # print(missed_lines)
+    # print(missed_branches)
 
     logger.info(f"Approximating paths for src file: {src_file}")
     methodDict = get_mut_paths(src, src_file, logger)
+    # print(methodDict)
 
     selected_paths = {}
     for method, paths in methodDict.items():
         # if method != 'is_fits': continue
         # print(method)
         # print(paths)
+        # if method == 'read_table_fits':
+        #     logger.info(paths)
         logger.info(f"Selecting paths for method: {method}")
         candidate_paths = []
         path_history.setdefault(method, {})
@@ -134,7 +138,6 @@ def main(
     instance_image_tag: str = "latest",
     report_dir: str = ".",
 ):
-    # instance_id = test_spec.instance_id
     log_dir = TESTENHANCER_LOG_DIR / run_id / instance_id
 
     # Set up logger
@@ -159,6 +162,37 @@ def main(
         )
         container.start()
         logger.info(f"Container for {instance_id} started: {container.id}")
+
+        # NOTE: apply gold and test patches
+        patch_content = instance['patch'] + instance['test_patch']
+        patch_file = Path(log_dir / "patch.diff")
+        patch_file.write_text(patch_content)
+        logger.info(
+            f"Intermediate patch for {instance_id} written to {patch_file}, now applying to container..."
+        )
+        copy_to_container(container, patch_file, PurePosixPath(DOCKER_PATCH))
+
+        # Attempt to apply patch to container (TODO: FIX THIS)
+        applied_patch = False
+        for git_apply_cmd in GIT_APPLY_CMDS:
+            val = container.exec_run(
+                f"{git_apply_cmd} {DOCKER_PATCH}",
+                workdir=DOCKER_WORKDIR,
+                user=DOCKER_USER,
+            )
+            if val.exit_code == 0:
+                logger.info(f"{APPLY_PATCH_PASS}:\n{val.output.decode(UTF8)}")
+                applied_patch = True
+                break
+            else:
+                logger.info(f"Failed to apply patch to container: {git_apply_cmd}")
+        if not applied_patch:
+            logger.info(f"{APPLY_PATCH_FAIL}:\n{val.output.decode(UTF8)}")
+            raise EvaluationError(
+                instance_id,
+                f"{APPLY_PATCH_FAIL}:\n{val.output.decode(UTF8)}",
+                logger,
+            )
 
         eval_file = Path(log_dir / "eval.sh")
         eval_file.write_text(test_spec.eval_script)

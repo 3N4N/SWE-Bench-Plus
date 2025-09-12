@@ -391,6 +391,22 @@ def make_eval_script_list_py(
           "echo '    assert 2 == 3'",
           f"}} >> astropy/io/fits/tests/test_connect.py",
     ])
+    new_test_content = '''
+import pytest
+from unittest import mock
+import pytest
+from astropy.io.fits import connect
+
+def test_is_fits_with_invalid_extensions():
+    assert connect.is_fits(None, 'file.txt', None) is False
+    assert connect.is_fits(None, 'file.jpg', None) is False
+    assert connect.is_fits(None, 'file.png', None) is False
+    assert connect.is_fits(None, 'file.docx', None) is False
+
+def test_is_fits_with_no_extension():
+    assert connect.is_fits(None, 'file', None) is False
+    '''
+    enan_apply_new_tests_command = f"cat >> astropy/io/fits/tests/test_connect.py <<'{HEREDOC_DELIMITER}'\n{new_test_content}\n{HEREDOC_DELIMITER}"
     test_command = " ".join(
         [
             MAP_REPO_VERSION_TO_SPECS[instance["repo"]][instance["version"]][

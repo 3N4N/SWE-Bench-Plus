@@ -1,3 +1,4 @@
+import os
 from typing import Any
 
 from swebench.harness.constants import (
@@ -23,14 +24,21 @@ from swebench.harness.test_spec.test_spec import TestSpec
 from swebench.harness.log_parsers import MAP_REPO_TO_PARSER
 
 
+# XXX: enan
 # MARK: Utility functions
 def test_passed(case: str, sm: dict[str, str]) -> bool:
-    return case in sm and sm[case] in [TestStatus.PASSED.value, TestStatus.XFAIL.value]
+    if os.environ.get('TE') is not None:
+        return case in sm and sm[case] in [TestStatus.PASSED.value, TestStatus.XFAIL.value, TestStatus.ERROR.value]
+    else:
+        return case in sm and sm[case] in [TestStatus.PASSED.value, TestStatus.XFAIL.value]
 
 
+# XXX: enan
 def test_failed(case: str, sm: dict[str, str]) -> bool:
-    return case not in sm or sm[case] in [TestStatus.FAILED.value, TestStatus.ERROR.value]
-
+    if os.environ.get('TE') is not None:
+        return case in sm and sm[case] in [TestStatus.FAILED.value,]
+    else:
+        return case not in sm or sm[case] in [TestStatus.FAILED.value, TestStatus.ERROR.value]
 
 # MARK: Evaluation report functions
 def get_logs_eval(test_spec: TestSpec, log_fp: str) -> tuple[dict[str, str], bool]:

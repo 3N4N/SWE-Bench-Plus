@@ -228,7 +228,7 @@ def extract_test_headers(repo, test_file, test_content):
         return tests
     elif repo in ['astropy/astropy', 'matplotlib/matplotlib', 'mwaskom/seaborn',
                   'pydata/xarray', 'pytest-dev/pytest', 'scikit-learn/scikit-learn',
-                  'sphinx-doc/sphinx', 'psf/requests' ]:
+                  'sphinx-doc/sphinx', 'psf/requests', 'pallets/flask', 'pylint-dev/pylint' ]:
         nodes = extract_nodes(test_content)
         tests = []
         for node in nodes:
@@ -240,7 +240,7 @@ def extract_test_headers(repo, test_file, test_content):
                 tests.append(f"{test_file}::{node}")
         return tests
     else:
-        print("ERROR: extract_test_headers: repo not recognized")
+        print(f"ERROR: extract_test_headers: repo {repo} not recognized")
         return []
 
 def get_node(repo, test_file, entry):
@@ -326,32 +326,8 @@ def make_test_spec(
 
     test_files = re.findall(r'^diff --git a/(.*?) b/', instance['test_patch'], flags=re.MULTILINE)
 
-    # def get_modified_files_from_patch(diff_text: str):
-    #     modified_files = []
-    #     for header in re.finditer(r"^diff --git a/(.+?) b/\1", diff_text, re.MULTILINE):
-    #         file_path = header.group(1)
-    #         # Ensure file is not marked as new or deleted
-    #         context_start = diff_text.find(header.group(0))
-    #         context = diff_text[context_start: context_start + 200]  # look ahead
-    #         if "new file mode" not in context and "deleted file mode" not in context:
-    #             modified_files.append(file_path)
-    #     return modified_files
-    # test_files = get_modified_files_from_patch(instance['test_patch'])
-
-    # print("-"*10, repo)
-    # for test_file in test_files:
-    #     testgen_patch_dir = Path(f"logs/test_enhancer/TE_2/{instance['instance_id']}")
-    #     test_file_path = testgen_patch_dir / f"{test_file.replace('/','__')}"
-    #     if test_file_path.is_file():
-    #         test_content = test_file_path.read_text(encoding=UTF8)
-    #         tests = extract_test_headers(repo, test_file, test_content)
-    #         for test in tests:
-    #             node = get_node(repo, test_file, test)
-    #             print(test, '->', node)
-    #     else:
-    #         print(f"File not found: {repo} -> {test_file}")
-
-    add_test_enhancer_patches = False
+    import os
+    add_test_enhancer_patches = os.environ.get('TE', None) is None
 
     if add_test_enhancer_patches:
         HEREDOC_DELIMITER = "EOF_114329324912"
@@ -359,66 +335,35 @@ def make_test_spec(
         new_fail_to_pass = list()
         TE_Id = os.environ['TE_ID']
         testgen_patch_dir = Path(f"logs/test_enhancer/{TE_Id}/{instance['instance_id']}")
-        run_instance_log_path = testgen_patch_dir / "run_instance.log"
-        run_instance_log = run_instance_log_path.read_text(encoding=UTF8)
-        coverage_reports = [ line for line in run_instance_log.split('\n') if "_coverage:" in line ]
-        cur_cov = 0
-        max_cov = 0
-        max_iter = -1
-        pattern = r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} - \w+ - (\d+ )?(?:cur|new)_coverage: (\d+\.\d+)"
-        for report in coverage_reports:
-            match = re.search(pattern, report)
-            if match:
-                iter, cov = match.groups()
-                if iter is None:
-                    cur_cov = float(cov)
-                else:
-                    iter, cov = int(iter), float(cov)
-                    if cov > max_cov:
-                        max_cov = cov
-                        max_iter = iter
-        # print(cur_cov)
-        # print(max_cov)
-        # print(max_iter)
-        if max_cov > cur_cov:
-            add_test_enhancer_patches = True
-        else:
-            add_test_enhancer_patches = False
-            print(f"{instance_id}: Not adding TestEnhancer patches")
-        test_files = []
-
-    if add_test_enhancer_patches:
         for test_file in test_files:
-            max_cov = 0
-            max_iter = -1
-            for i in range(100):
+            test_file_path = testgen_patch_dir / f"{test_file.replace('/','__')}"
+            # print(test_file_path)
+            if not test_file_path.is_file(): continue
+            test_content = test_file_path.read_text(encoding=UTF8)
+            test_headers = extract_test_headers(repo, test_file, test_content)
+            for i in range(9)[::-1]:
                 file_output_dir = testgen_patch_dir / str(i)
-                file_output_path = file_output_dir / f"{test_file.replace('/','__')}"
-                if file_output_dir.is_dir():
-                    cov_output_path = file_output_dir / 'coverage.json'
-                    with cov_output_path.open("r", encoding=UTF8) as f:
-                        cov_report = json.load(f)
-                    this_cov = cov_report['totals']['percent_covered']
-                    if this_cov > max_cov:
-                        max_cov = this_cov
-                        max_iter = i
-                        # print(max_cov, max_iter, this_cov)
-            if max_iter != -1:
-                file_output_path = testgen_patch_dir / str(max_iter) / f"{test_file.replace('/','__')}"
-                if file_output_path.is_file():
-                    print(file_output_path)
-                    test_content = file_output_path.read_text(encoding=UTF8)
+                if not file_output_dir.is_dir(): continue
+                test_file_path = file_output_dir / f"out_{test_file.replace('/','__')}"
+                if test_file_path.is_file():
+                    new_test_content = test_file_path.read_text(encoding=UTF8)
                     update_test_file_command.append(
-                        f"cat > {test_file} <<'{HEREDOC_DELIMITER}'\n{test_content}\n{HEREDOC_DELIMITER}"
+                        f"cat > {test_file} <<'{HEREDOC_DELIMITER}'\n{new_test_content}\n{HEREDOC_DELIMITER}"
                     )
-                    new_test_file = testgen_patch_dir / str(max_iter) / f"new_{test_file.replace('/','__')}"
-                    new_test_content = new_test_file.read_text(encoding=UTF8)
-                    new_fail_to_pass.extend( extract_test_headers(repo, test_file, new_test_content))
+                    new_test_headers = extract_test_headers(repo, test_file, new_test_content)
+                    new_test_headers = set(new_test_headers) - set(test_headers)
+                    print(new_test_headers)
+                    new_fail_to_pass.extend(list(new_test_headers))
+                    break
 
         eval_script_list = eval_script_list[:-4] + update_test_file_command + eval_script_list[-4:]
         fail_to_pass.extend(new_fail_to_pass)
 
     # fail_to_pass.append('astropy/io/fits/tests/test_connect.py::test_testenhancer_failing')
+    # fail_to_pass.extend([
+    #     'astropy/io/fits/tests/test_connect.py::test_is_fits_with_invalid_extensions',
+    #     'astropy/io/fits/tests/test_connect.py::test_is_fits_with_no_extension',
+    # ])
 
     return TestSpec(
         instance_id=instance_id,

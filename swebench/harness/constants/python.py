@@ -13,19 +13,23 @@ TEST_SYMPY = (
     "PYTHONWARNINGS='ignore::UserWarning,ignore::SyntaxWarning' bin/test -C --verbose"
 )
 TEST_SYMPY_VERBOSE = "bin/test -C --verbose"
+TEST_SKLEARN = "pytest -rA"
 
-TEST_ASTROPY_PYTEST = "pytest --cov=astropy --cov-branch --cov-report json -rA -vv -o console_output_style=classic --tb=no"
-TEST_DJANGO = "coverage run --branch ./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1"
-TEST_DJANGO_NO_PARALLEL = "coverage run --branch ./tests/runtests.py --verbosity 2"
-TEST_SEABORN = "pytest --cov --cov-branch --cov-report json --no-header -rA"
-TEST_SEABORN_VERBOSE = "pytest -rA --cov --cov-branch --cov-report json --tb=long"
-TEST_PYTEST = "pytest -rA --cov --cov-branch --cov-report json"
-TEST_PYTEST_VERBOSE = "pytest -rA --cov --cov-branch --cov-report json --tb=long"
-TEST_SPHINX = "tox --current-env -epy39 -v --"
-TEST_SYMPY = (
-    "PYTHONWARNINGS='ignore::UserWarning,ignore::SyntaxWarning' coverage run --branch bin/test -C --verbose"
-)
-TEST_SYMPY_VERBOSE = "coverage run --branch bin/test -C --verbose"
+import os
+if os.environ.get('TE') is not None:
+    TEST_ASTROPY_PYTEST = "pytest --cov=astropy --cov-branch --cov-report json -rA -vv -o console_output_style=classic --tb=no"
+    TEST_DJANGO = "coverage run --branch ./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1"
+    TEST_DJANGO_NO_PARALLEL = "coverage run --branch ./tests/runtests.py --verbosity 2"
+    TEST_SEABORN = "pytest --cov --cov-branch --cov-report json --no-header -rA"
+    TEST_SEABORN_VERBOSE = "pytest -rA --cov --cov-branch --cov-report json --tb=long"
+    TEST_PYTEST = "pytest -rA --cov --cov-branch --cov-report json"
+    TEST_PYTEST_VERBOSE = "pytest -rA --cov --cov-branch --cov-report json --tb=long"
+    TEST_SPHINX = "tox --current-env -epy39 -v --"
+    TEST_SYMPY = (
+        "PYTHONWARNINGS='ignore::UserWarning,ignore::SyntaxWarning' coverage run --branch bin/test -C --verbose"
+    )
+    TEST_SYMPY_VERBOSE = "coverage run --branch bin/test -C --verbose"
+    TEST_SKLEARN = "coverage run --branch -m pytest -rA"
 
 # Constants - Installation Specifications
 SPECS_SKLEARN = {
@@ -39,7 +43,7 @@ SPECS_SKLEARN = {
             "setuptools",
             "scipy==1.5.2",
         ],
-        "test_cmd": TEST_PYTEST,
+        "test_cmd": TEST_SKLEARN,
     }
     for k in ["0.20", "0.21", "0.22"]
 }

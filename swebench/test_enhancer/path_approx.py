@@ -144,6 +144,16 @@ def get_mut_paths(src, name, logger):
     return methodDict
 
 
+def _main():
+    log_dir = Path("/tmp")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / LOG_INSTANCE
+    instance_id = "XXX"
+    logger = setup_logger(instance_id, log_file)
+    src = Path('tmp.py').read_text(encoding=UTF8)
+    methodDict = get_mut_paths(src, "tmp", logger)
+    print(methodDict)
+
 def main(
     instance_id,
     dataset_name,
@@ -329,3 +339,4 @@ if __name__ == "__main__":
         args.instance_image_tag,
         args.report_dir,
     )
+    # _main()

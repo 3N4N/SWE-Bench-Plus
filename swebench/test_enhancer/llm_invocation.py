@@ -47,6 +47,7 @@ class LLMInvocation:
         max_retries = 3
         base_delay = 2  # base delay in seconds
 
+        error_statement = None
         for attempt in range(max_retries):
             try:
                 response = litellm.completion(**completion_params)
@@ -72,5 +73,8 @@ class LLMInvocation:
                       f"(Attempt {attempt + 1}/{max_retries})")
                 time.sleep(delay)
                 print(e)
+                error_statement = e
 
-        raise RuntimeError("Max retries exceeded. Could not complete API call.")
+        print("LLM invocation failed")
+        return False, f"LLM invocation failed: {error_statement}"
+        # raise RuntimeError("Max retries exceeded. Could not complete API call.")

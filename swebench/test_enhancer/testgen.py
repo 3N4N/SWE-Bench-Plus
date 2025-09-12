@@ -1,11 +1,13 @@
 import re
 import math
+import yaml
 import json
 import docker
 import jinja2
 import platform
 import traceback
 
+from typing import Iterable, Set, Dict, List
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
 from pathlib import Path, PurePosixPath
 
@@ -63,8 +65,10 @@ from swebench.harness.test_spec.create_scripts import make_eval_script_list
 from swebench.test_enhancer.path_approx import get_mut_paths, pairwise
 from swebench.test_enhancer.path_selection import select_uncovered_paths
 from swebench.test_enhancer.llm_invocation import LLMInvocation
+from swebench.test_enhancer.util import split_imports_and_code, remove_duplicate_defs
 
 HEREDOC_DELIMITER = "EOF_114329324913"
+ADD_PATCH_CONTENT = True
 
 def reset_repo(container, instance, timeout, logger):
     env_name = "testbed"
@@ -123,9 +127,8 @@ index 43edc4520..7ca468e32 100644
             logger,
         )
 
-def run_tests(container, instance, log_dir, timeout, logger): #, patch_coverage=False):
+def run_tests(container, instance, log_dir, timeout, logger):
     instance_id = instance['instance_id']
-    log_dir.mkdir(parents=True, exist_ok=True)
     env_name = "testbed"
     repo_directory = f"/{env_name}"
     specs = MAP_REPO_VERSION_TO_SPECS[instance['repo']][instance['version']]
@@ -365,7 +368,7 @@ def get_successful_tests(container, dataset_name, split, instance,
     logger.info(f"Remove failed targets: {to_remove}")
     if to_remove is not None and len(to_remove) > 0:
         correct_test_content = remove_functions_from_file(test_content, to_remove)
-        # logger.info(correct_test_content)
+        logger.info(correct_test_content)
     else:
         correct_test_content = test_content
     return correct_test_content
@@ -387,46 +390,47 @@ def get_failed_tests(container, dataset_name, split, instance,
         correct_test_content = test_content
     return correct_test_content
 
-def build_prompt(src_file, src_numbered, test_file, test_content, selected_paths, log_dir):
+def build_prompt(src_file, src_numbered, test_file, test_content, patch_content,
+                 selected_paths, rem_codeblock, log_dir):
     test_template = """
 Please generate test for `{{method_name}}` to cover the path
 {{selected_path_for_method}}
 -----------------------------------------------------------
     """
     jenv = jinja2.Environment(loader=jinja2.FileSystemLoader("swebench/test_enhancer/templates/"))
-    test_prompt = []
-    for method, paths in selected_paths.items():
-        for path in paths:
-            lines_in_path = []
-            for node in path:
-                if node[0] == node[1]:
-                    lines_in_path.append(node[0])
-                else:
-                    lines_in_path.extend(list(range(node[0], node[1]+1)))
-            path_src = [
-                src_numbered[line]
-                for line in range(len(src_numbered))
-                if line+1 in lines_in_path
-            ]
-            path_src = "\n".join(path_src)
-            _test_prompt = jenv.from_string(test_template).render(method_name=method, selected_path_for_method=path_src)
-            test_prompt.append(_test_prompt)
-    if len(test_prompt) == 0:
-        _test_prompt = "Please generated tests for the whole source file given above"
-        test_prompt.append(_test_prompt)
-    test_prompt = """
-
-## Methods Under Test
-""" + "\n".join(test_prompt)
     user_prompt = jenv.get_template("python_base.txt").render(
         source_file=src_file, source_numbered="\n".join(src_numbered),
-        test_file=test_file, test_content=test_content
+        test_file=test_file, test_content=test_content, count = 10,
+        patch_content=patch_content, add_patch_content = ADD_PATCH_CONTENT,
+        add_failed_tests_section=False,  failed_tests_section=rem_codeblock,
     )
-    user_prompt = user_prompt + test_prompt
-    # print("="*60)
-    # print(test_prompt)
-    # print("="*60)
-    # print(selected_paths)
+    if not ADD_PATCH_CONTENT:
+        test_prompt = []
+        for method, paths in selected_paths.items():
+            for path in paths:
+                lines_in_path = []
+                for node in path:
+                    if node[0] == node[1]:
+                        lines_in_path.append(node[0])
+                    else:
+                        lines_in_path.extend(list(range(node[0], node[1]+1)))
+                path_src = [
+                    src_numbered[line]
+                    for line in range(len(src_numbered))
+                    if line+1 in lines_in_path
+                ]
+                path_src = "\n".join(path_src)
+                _test_prompt = jenv.from_string(test_template).render(method_name=method, selected_path_for_method=path_src)
+                test_prompt.append(_test_prompt)
+        if len(test_prompt) == 0:
+            _test_prompt = "Please generated tests for the whole source file given above"
+            test_prompt.append(_test_prompt)
+        test_prompt = """
+
+## Methods Under Test
+        """ + "\n".join(test_prompt)
+        user_prompt = user_prompt + test_prompt
+
     system_prompt = "You are an expert Python test-driven developer"
     file_output_path = log_dir / f"prompt.txt"
     with open(file_output_path, "w") as f:
@@ -434,115 +438,56 @@ Please generate test for `{{method_name}}` to cover the path
     return {"system": system_prompt, "user": user_prompt}
 
 
-def generate_test_by_prompt_llm(model, prompt, log_dir, iter):
+def generate_test_by_prompt_llm(model, prompt, logger, log_dir, iter):
 
-    llm_invoker =  LLMInvocation(model)
-    response, prompt_token_count, response_token_count = llm_invoker.call_model(prompt)
-    token_count = prompt_token_count + response_token_count
+    # llm_invoker =  LLMInvocation(model)
+    # response_tuple = llm_invoker.call_model(prompt)
+    # if response_tuple[0]:
+    #     response, prompt_token_count, response_token_count = response_tuple
+    # else:
+    #     logger.info(response_tuple[1])
+    #     return False
+    # token_count = prompt_token_count + response_token_count
+    # response_path = log_dir / "response.txt"
+    # with open(response_path, "w") as f:
+    #     f.write(response)
+
+    from pathlib import Path
+    response = Path('tmp.py').read_text(encoding='utf-8')
     response_path = log_dir / "response.txt"
     with open(response_path, "w") as f:
         f.write(response)
 
-    if False:
+    tests_dict = load_yaml(response, logger)
+    import_code = tests_dict.get("new_imports_code", "")
+    test_code = tests_dict.get("test_code", "")
+    import_code = import_code if isinstance(import_code, str) else ""
+    test_code = test_code if isinstance(test_code, str) else ""
+    codeblock = import_code + "\n" + test_code
 
-        response = """
-This is the dummy response
-```python
-def test_pass():
-    assert 2 == 1+1
-def test_fail():
-    assert 2 == 1-1
-```
-        """
-
-        if iter == 0:
-            response = '''
-To enhance the test coverage for the `read_table_fits` function, we need to focus on the specific paths and conditions within the function. The paths we want to cover are:
-
-1. When the input is an `HDUList` and contains multiple tables.
-2. When the input is an `HDUList` and contains a single table.
-3. When the input is an `HDUList` but contains no tables, which should raise a `ValueError`.
-
-Here are the test cases that cover these scenarios:
-
-```python
-import pytest
-import numpy as np
-from astropy.io.fits import HDUList, BinTableHDU, PrimaryHDU
-from astropy.table import Table
-from astropy.utils.exceptions import AstropyUserWarning
-
-def test_read_table_fits_multiple_tables(tmp_path):
-    # Create an HDUList with multiple tables
-    data1 = np.array([(1, 'a'), (2, 'b')], dtype=[('col1', int), ('col2', 'U1')])
-    data2 = np.array([(3, 'c'), (4, 'd')], dtype=[('col3', int), ('col4', 'U1')])
-    hdu1 = BinTableHDU(data1, name='FIRST')
-    hdu2 = BinTableHDU(data2, name='SECOND')
-    hdulist = HDUList([PrimaryHDU(), hdu1, hdu2])
-
-    # Write to a temporary file
-    filename = tmp_path / "test_multiple_tables.fits"
-    hdulist.writeto(filename, overwrite=True)
-
-    # Read the table without specifying HDU
-    with pytest.warns(AstropyUserWarning, match="hdu= was not specified but multiple tables are present"):
-        table = Table.read(filename)
-    assert np.all(table['col1'] == data1['col1'])
-    assert np.all(table['col2'] == data1['col2'])
-
-def test_read_table_fits_single_table(tmp_path):
-    # Create an HDUList with a single table
-    data = np.array([(1, 'a'), (2, 'b')], dtype=[('col1', int), ('col2', 'U1')])
-    hdu = BinTableHDU(data, name='ONLY')
-    hdulist = HDUList([PrimaryHDU(), hdu])
-
-    # Write to a temporary file
-    filename = tmp_path / "test_single_table.fits"
-    hdulist.writeto(filename, overwrite=True)
-
-    # Read the table without specifying HDU
-    table = Table.read(filename)
-    assert np.all(table['col1'] == data['col1'])
-    assert np.all(table['col2'] == data['col2'])
-
-def test_read_table_fits_no_table(tmp_path):
-    # Create an HDUList with no tables
-    hdulist = HDUList([PrimaryHDU()])
-
-    # Write to a temporary file
-    filename = tmp_path / "test_no_table.fits"
-    hdulist.writeto(filename, overwrite=True)
-
-    # Attempt to read the table should raise ValueError
-    with pytest.raises(ValueError, match="No table found"):
-        Table.read(filename)
-```
-
-### Explanation:
-
-1. **`test_read_table_fits_multiple_tables`**: This test creates an `HDUList` with multiple tables and checks if the first table is read by default, emitting a warning about multiple tables being present.
-
-2. **`test_read_table_fits_single_table`**: This test creates an `HDUList` with a single table and verifies that the table is read correctly without any warnings.
-
-3. **`test_read_table_fits_no_table`**: This test creates an `HDUList` with no tables and ensures that attempting to read it raises a `ValueError` with the message "No table found".
-
-These tests should cover the specified paths in the `read_table_fits` function, ensuring that the function behaves as expected in these scenarios.
-            '''
-
-    response_list = response.split('\n')
-    started = False
-    codeblock = []
-    for line in response_list:
-        if not started and line.startswith('```'):
-            started = True
-            continue
-        if started:
-            if line.startswith('```'):
-                started = False
-                break
-            codeblock.append(line)
-    codeblock = "\n".join(codeblock)
+    codeblock_path = log_dir / "codeblock.txt"
+    with open(codeblock_path, "w") as f:
+        f.write(codeblock)
     return response, codeblock
+
+def load_yaml(response_text, logger):
+    response_text = response_text.strip().removeprefix("```yaml").rstrip("`")
+    try:
+        data = yaml.safe_load(response_text)
+    except Exception as e:
+        logger.info(
+            f"Failed to parse AI prediction: {e}." # Attempting to fix YAML formatting."
+        )
+        # data = try_fix_yaml(response_text, keys_fix_yaml=keys_fix_yaml)
+        # if not data:
+        #     logger.info(f"Failed to parse AI prediction after fixing YAML formatting.")
+        return {}
+    codeblock = data.get('test_code', '')
+    if isinstance(codeblock, list):
+        codeblock = "\n".join(codeblock)
+        data['test_code'] = codeblock
+    return data
+
 
 def write_to_test_file(container, log_dir, test_file, test_content, logger):
     new_test_file = Path(log_dir / f"{test_file.replace('/','__')}" )
@@ -571,6 +516,7 @@ def reset_test_file(container, log_dir, test_file, test_content, logger):
     write_to_test_file(container, log_dir, test_file, test_content, logger)
 
 def generate_tests(model, container, dataset_name, split, instance, test_spec, log_dir, src_file, src, test_file, tests, timeout, logger):
+    orig_tests = tests
     instance_id = instance['instance_id']
     ## TODO: testDeps = extractDependenciesForTestScope()
     iter, iter_no_increase = 0, 0
@@ -578,8 +524,8 @@ def generate_tests(model, container, dataset_name, split, instance, test_spec, l
     # failedTestFeedback = []
     # methodDict = Algorithm 1 (srcFile)
     # TODO: maxCYC = getMaxComplexity(methodDict)
-    maxCYC = 10
-    maxNoIncreaseLimit = 3
+    maxCYC = 5
+    maxNoIncreaseLimit = 5
 
     patch_coverage(container, instance, timeout, logger)
 
@@ -588,61 +534,89 @@ def generate_tests(model, container, dataset_name, split, instance, test_spec, l
     # apply_test_patch(container, instance, log_dir, logger)
     reset_test_file(container, log_dir, test_file, tests, logger)
 
-    test_output_path = run_tests(container, instance, log_dir, timeout, logger) #, patch_coverage=True)
-    cur_cov_report = get_coverage(container, instance, log_dir, timeout, logger)
+    cur_coverage = 50
+    if not ADD_PATCH_CONTENT:
+        test_output_path = run_tests(container, instance, log_dir, timeout, logger)
+        cur_cov_report = get_coverage(container, instance, log_dir, timeout, logger)
 
-    try:
-        cur_coverage = cur_cov_report['files'][src_file]['summary']['percent_covered']
-    except KeyError:
-        logger.error(f"Coverage of src file {src_file} not found. Setting to 0.")
-        cur_coverage = 0.0
-    logger.info(f"cur_coverage: {cur_coverage}")
+        try:
+            cur_coverage = cur_cov_report['files'][src_file]['summary']['percent_covered']
+        except KeyError:
+            logger.error(f"Coverage of src file {src_file} not found. Setting to 0.")
+            cur_coverage = 0.0
+        logger.info(f"cur_coverage: {cur_coverage}")
 
-    # selected_paths = select_uncovered_paths(cur_cov_report, src_file, src, path_history, logger)
-    # print(selected_paths)
-    # return
+        # selected_paths = select_uncovered_paths(cur_cov_report, src_file, src, path_history, logger)
+        # print(selected_paths)
+        # return
 
-    while iter_no_increase < maxNoIncreaseLimit and iter < maxCYC and math.ceil(cur_coverage) < 100:
+    n_tests = 0
+    src_numbered = get_lined_source(src)
+    rem_codeblock = None
+
+    while n_tests < 3 and iter_no_increase < maxNoIncreaseLimit and iter < maxCYC and math.ceil(cur_coverage) < 100:
+        logger.info(f"This is iteration: {iter}")
         _log_dir = log_dir / str(iter)
         _log_dir.mkdir(parents=True, exist_ok=True)
-        selected_paths = select_uncovered_paths(cur_cov_report, src_file, src, path_history, logger)
-        src_numbered = get_lined_source(src)
 
-        prompt = build_prompt(src_file, src_numbered, test_file, tests, selected_paths, _log_dir)
-        response, codeblock = generate_test_by_prompt_llm(model, prompt, _log_dir, iter)
-
-        if True:        # conditional for devel purposes
-            # get FAILED tests on buggy repo
-            reset_repo(container, instance, timeout, logger)
-            # apply_test_patch(container, instance, log_dir, logger)
-            reset_test_file(container, _log_dir, test_file, tests, logger)
-            new_tests = add_tests_to_test_file(container, _log_dir, codeblock, src_file, test_file, tests, logger )
-            test_output_path = run_tests(container, instance, _log_dir, timeout, logger)
-            new_codeblock = get_failed_tests(container, dataset_name, split, instance, test_spec, test_file, codeblock, test_output_path, log_dir, timeout, logger)
+        if not ADD_PATCH_CONTENT:
+            selected_paths = select_uncovered_paths(cur_cov_report, src_file, src, path_history, logger)
         else:
-            new_codeblock = codeblock
+            selected_paths = None
+
+        prompt = build_prompt(src_file, src_numbered, test_file, tests, instance['patch'], selected_paths, rem_codeblock, _log_dir)
+        llm_generation = generate_test_by_prompt_llm(model, prompt, logger, _log_dir, iter)
+        if llm_generation:
+            response, codeblock = llm_generation
+            codeblock = remove_duplicate_defs(tests, codeblock)
+        else:
+            break
+
+        # get FAILED tests on buggy repo
+        reset_repo(container, instance, timeout, logger)
+        # apply_test_patch(container, instance, log_dir, logger)
+        reset_test_file(container, _log_dir, test_file, tests, logger)
+        new_tests = add_tests_to_test_file(container, _log_dir, codeblock, src_file, test_file, tests, logger )
+        test_output_path = run_tests(container, instance, _log_dir, timeout, logger)
+        new_codeblock = get_failed_tests(container, dataset_name, split, instance, test_spec, test_file, codeblock, test_output_path, log_dir, timeout, logger)
 
         # get PASSED tests after applying gold patch
         apply_gold_patch(container, instance, log_dir, logger)
         new_tests = add_tests_to_test_file(container, _log_dir, new_codeblock, src_file, test_file, tests, logger )
         test_output_path = run_tests(container, instance, _log_dir, timeout, logger)
         new_codeblock = get_successful_tests(container, dataset_name, split, instance, test_spec, test_file, new_codeblock, test_output_path, log_dir, timeout, logger)
-
         new_tests = add_tests_to_test_file(container, _log_dir, new_codeblock, src_file, test_file, tests, logger )
-        test_output_path = run_tests(container, instance, _log_dir, timeout, logger)
-        new_cov_report = get_coverage(container, instance, _log_dir, timeout, logger)
-        new_coverage = new_cov_report['files'][src_file]['summary']['percent_covered']
-        logger.info(f"{iter} new_coverage: {new_coverage}")
-        # print(new_tests)
 
-        if new_coverage > cur_coverage:
-            tests = new_tests
-            cur_coverage = new_coverage
-            iter_no_increase = 0
+        if not ADD_PATCH_CONTENT:
+            new_tests = add_tests_to_test_file(container, _log_dir, new_codeblock, src_file, test_file, tests, logger )
+            test_output_path = run_tests(container, instance, _log_dir, timeout, logger)
+            new_cov_report = get_coverage(container, instance, _log_dir, timeout, logger)
+            new_coverage = new_cov_report['files'][src_file]['summary']['percent_covered']
+            logger.info(f"{iter} new_coverage: {new_coverage}")
+            # print(new_tests)
+
+            if new_coverage > cur_coverage:
+                tests = new_tests
+                cur_coverage = new_coverage
+                iter_no_increase = 0
+            else:
+                iter_no_increase += 1
         else:
-            iter_no_increase += 1
+            num_functions = sum(isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) for n in ast.walk(ast.parse(new_codeblock)))
+            n_tests += num_functions
+            logger.info(f"{iter}: #tests = {num_functions} / {n_tests}")
+            if num_functions > 0:
+                tests = new_tests
+                file_output_path = _log_dir / f"out_{test_file.replace('/','__')}"
+                with open(file_output_path, "w") as f:
+                    f.write(tests)
+                    logger.info(f"Generated FINAL tests for {src_file} written to {file_output_path}")
+                iter_no_increase = 0
+            else:
+                iter_no_increase += 1
 
         iter += 1
+        logger.info("-"*60)
 
 def get_lined_source(src, range=None):
     src = src.split('\n')
@@ -725,6 +699,9 @@ def main(
     src_files = re.findall(r'^diff --git a/(.*?) b/', instance['patch'], flags=re.MULTILINE)
     test_files = re.findall(r'^diff --git a/(.*?) b/', instance['test_patch'], flags=re.MULTILINE)
 
+    logger.info(src_files)
+    logger.info(test_files)
+
     # def get_modified_files_from_patch(diff_text: str):
     #     modified_files = []
     #     for header in re.finditer(r"^diff --git a/(.+?) b/\1", diff_text, re.MULTILINE):
@@ -782,10 +759,18 @@ def main(
                 test_tail = test_file.split('/')[-1].split('.py')[0]
                 if test_tail == f'test_{src_tail}':
                     return test_file
+            for test_file in test_files:
+                test_tail = test_file.split('/')[-1].split('.py')[0]
+                if src_tail in test_tail:
+                    return test_file
+            return test_files[0]
+
         for src_file in src_files:
             test_file = match_test_file(src_file, test_files)
-            if test_file is None: continue
-            print(f"Generating tests for {src_file} -> {test_file}")
+            if test_file is None:
+                logger.info(f"No matching test file for {src_file}")
+                continue
+            logger.info(f"Generating tests for {src_file} -> {test_file}")
             path_history = dict()
             file_output_path = log_dir / f"{src_file.replace('/','__')}"
             src = get_file_output(src_file, file_output_path)
