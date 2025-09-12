@@ -25,7 +25,8 @@ def copy_to_container(container: Container, src: Path, dst: Path):
         dst (Path): Destination file path in the container
     """
     # Check if destination path is valid
-    if os.path.dirname(dst) == "":
+    # if os.path.dirname(dst) == "":    # enan
+    if Path(dst.parent).is_dir() == "":
         raise ValueError(
             f"Destination path parent directory cannot be empty!, dst: {dst}"
         )
