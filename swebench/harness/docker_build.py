@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import re
 import docker
 import docker.errors
 import logging
 import sys
 import traceback
+import subprocess
 
 from pathlib import Path
 
@@ -458,14 +460,27 @@ def build_container(
         try:
             client.images.get(test_spec.instance_image_key)
         except docker.errors.ImageNotFound:
-            try:
-                client.images.pull(test_spec.instance_image_key)
-            except docker.errors.NotFound as e:
-                raise BuildImageError(test_spec.instance_id, str(e), logger) from e
-            except Exception as e:
-                raise Exception(
-                    f"Error occurred while pulling image {test_spec.base_image_key}: {str(e)}"
+            if client.info().get("Name", None) == "hestia":
+                logger.info(f"podman pull docker.io/{test_spec.instance_image_key}")
+                result = subprocess.run(
+                    f"podman --storage-opt ignore_chown_errors=true pull docker.io/{test_spec.instance_image_key}".split(),
+                    capture_output=True,
+                    text=True
                 )
+                logger.info(f"podman pull stdout:\n{result.stdout}")
+                if not bool(re.fullmatch(r"[A-Fa-f0-9]{64}", result.stdout.strip())):
+                    raise Exception(
+                        f"Error occurred while pulling image {test_spec.base_image_key}: {result.stderr}"
+                    )
+            else:
+                try:
+                    client.images.pull(test_spec.instance_image_key)
+                except docker.errors.NotFound as e:
+                    raise BuildImageError(test_spec.instance_id, str(e), logger) from e
+                except Exception as e:
+                    raise Exception(
+                        f"Error occurred while pulling image {test_spec.base_image_key}: {str(e)}"
+                    )
 
     container = None
     try:
